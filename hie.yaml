@@ -1,0 +1,8 @@
+cradle:
+  stack:
+    - path: "./src"
+      component: "libjuice-hs:lib"
+    - path: "./test-suite"
+      component: "libjuice-hs:test:tests"
+    - path: "./app"
+      component: "libjuice-hs:exe:libjuice-hs"

@@ -1,0 +1,97 @@
+name: libjuice-hs
+version: '0.0.0'
+synopsis: An example project
+description: An example project
+maintainer: Philipp Balzarek
+
+dependencies:
+  - base
+  - aeson
+  - async
+  - bytestring
+  - containers
+  - data-default
+  - lens
+  - mtl
+  - text
+
+default-extensions:
+  - ApplicativeDo
+  - ConstraintKinds
+  - DataKinds
+  - DefaultSignatures
+  - DeriveFunctor
+  - DeriveGeneric
+  - DeriveLift
+  - DerivingStrategies
+  - DerivingVia
+  - FlexibleContexts
+  - FlexibleInstances
+  - FunctionalDependencies
+  - GADTs
+  - GeneralisedNewtypeDeriving
+  - LambdaCase
+  - MultiParamTypeClasses
+  - MultiWayIf
+  - NumericUnderscores
+  - OverloadedLabels
+  - OverloadedStrings
+  - PatternSynonyms
+  - PolyKinds
+  - QuantifiedConstraints
+  - QuasiQuotes
+  - RankNTypes
+  - RecordWildCards
+  - ScopedTypeVariables
+  - StandaloneDeriving
+  - TupleSections
+  - TypeApplications
+  - TypeFamilies
+  - TypeFamilyDependencies
+  - TypeOperators
+  - UndecidableInstances
+  - ViewPatterns
+
+ghc-options:
+    - -Wall
+    - -Werror=incomplete-patterns
+    - -Werror=incomplete-uni-patterns
+    - -Werror=incomplete-record-updates
+
+executables:
+  libjuice-hs:
+    dependencies:
+    - libjuice-hs
+    ghc-options:
+    - -rtsopts
+    - -threaded
+    - -with-rtsopts=-N
+    - -Wall
+    main: Main.hs
+    source-dirs: app
+    extra-source-files:
+    - CHANGELOG.md
+    - LICENSE.md
+    - README.md
+    - package.yaml
+    - stack.yaml
+
+library:
+  dependencies:
+  - base
+  source-dirs: src
+
+tests:
+  tests:
+    dependencies:
+    - libjuice-hs
+    - hedgehog
+    - tasty
+    - tasty-hedgehog
+    - tasty-hspec
+    ghc-options:
+    - -rtsopts
+    - -threaded
+    - -with-rtsopts=-N
+    main: Main.hs
+    source-dirs: test-suite
