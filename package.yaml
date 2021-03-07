@@ -4,6 +4,19 @@ synopsis: An example project
 description: An example project
 maintainer: Philipp Balzarek
 
+extra-libraries:
+  - pthread
+include-dirs: libjuice/include/juice
+c-sources:
+  - libjuice/src/*.c
+cc-options:
+  - -O2
+  - -DNO_SERVER
+-includes:
+  - libjuice/src/*.h
+extra-source-files:
+  - libjuice/include/**/*.h
+
 dependencies:
   - base
   - aeson
@@ -14,6 +27,8 @@ dependencies:
   - lens
   - mtl
   - text
+  - inline-c
+  - exceptions
 
 default-extensions:
   - ApplicativeDo

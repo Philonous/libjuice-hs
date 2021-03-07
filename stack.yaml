@@ -8,4 +8,4 @@ extra-deps:
 nix:
   packages:
     - zlib
-    - postgresql
+    - haskellPackages.c2hs
