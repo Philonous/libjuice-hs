@@ -116,6 +116,16 @@ newAgent Config{..} Callbacks{..} =
     port :: Word16 -> CUShort
     port = fromIntegral
 
+touchAgent :: Agent -> IO ()
+touchAgent (Agent agent) = touchForeignPtr agent
+
+withNewAgent :: Config -> Callbacks -> (Agent -> IO a) -> IO a
+withNewAgent config callbacks f = do
+  agent <- newAgent config callbacks
+  res <- f agent
+  touchAgent agent
+  return res
+
 checkError :: IO CInt -> IO ()
 checkError f = do
   res <- f
@@ -127,24 +137,24 @@ gatherCandidates :: Agent -> IO ()
 gatherCandidates agent = withAgent agent $ \agentPtr ->
   checkError $ {#call juice_gather_candidates#} agentPtr
 
-getLocalDescription :: Agent -> IO ByteString
+getLocalDescription :: Agent -> IO Text
 getLocalDescription agent = fmap snd $
   withAgent agent $ \agentPtr ->
-  bsOut maxCandidateSdpStringLen $ \buffer ->
+  textOut maxCandidateSdpStringLen $ \buffer ->
     checkError $ {#call juice_get_local_description #} agentPtr buffer
     (fromIntegral maxCandidateSdpStringLen)
 
-setRemoteDescription :: Agent -> ByteString -> IO ()
+setRemoteDescription :: Agent -> Text -> IO ()
 setRemoteDescription agent bs =
   withAgent agent $ \agentPtr ->
-  BS.useAsCString bs $ \ptr ->
+  BS.useAsCString (Text.encodeUtf8 bs) $ \ptr ->
   checkError $ {#call juice_set_remote_description#} agentPtr ptr
 
-addRemoteCandidate :: Agent -> ByteString -> IO ()
+addRemoteCandidate :: Agent -> Text -> IO ()
 addRemoteCandidate agent bs =
   withAgent agent $ \agentPtr ->
-  BS.useAsCString bs $ \ptr ->
-  checkError $ {#call juice_set_remote_description#} agentPtr ptr
+  BS.useAsCString (Text.encodeUtf8 bs) $ \ptr ->
+  checkError $ {#call juice_add_remote_candidate#} agentPtr ptr
 
 setRemoteGatheringDone :: Agent -> IO ()
 setRemoteGatheringDone agent = withAgent agent $ \agentPtr ->
@@ -166,25 +176,25 @@ getState :: Agent -> IO State
 getState agent = withAgent agent $ \agentPtr ->
   (toEnum . fromIntegral) <$> {#call juice_get_state#} agentPtr
 
-getSelectedCanidates :: Agent -> IO (ByteString, ByteString)
-getSelectedCanidates agent = fmap (\(((), remote), local) -> (local, remote)) $
+getSelectedCandidates :: Agent -> IO (Text, Text)
+getSelectedCandidates agent = fmap (\(((), remote), local) -> (local, remote)) $
   withAgent agent $ \agentPtr ->
-  bsOut 4096 $ \local ->
-  bsOut 4096 $ \remote ->
+  textOut 4096 $ \local ->
+  textOut 4096 $ \remote ->
     checkError $ {#call juice_get_selected_candidates#} agentPtr
        local 4096 remote 4096
 
-getSelectedAddresses :: Agent -> IO (ByteString, ByteString)
+getSelectedAddresses :: Agent -> IO (Text, Text)
 getSelectedAddresses agent = fmap (\(((), remote), local) -> (local, remote)) $
   withAgent agent $ \agentPtr ->
-  bsOut 4096 $ \local ->
-  bsOut 4096 $ \remote ->
+  textOut 4096 $ \local ->
+  textOut 4096 $ \remote ->
     checkError $ {#call juice_get_selected_addresses#} agentPtr
        local 4096 remote 4096
 
 
-bsOut bufsize f =
+textOut bufsize f =
   allocaBytes bufsize $ \ptr -> do
     res <- f ptr
     bs <- BS.packCString ptr
-    return (res, bs)
+    return (res, Text.decodeUtf8 bs)

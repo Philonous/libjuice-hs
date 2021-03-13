@@ -12,8 +12,9 @@ c-sources:
 cc-options:
   - -O2
   - -DNO_SERVER
--includes:
-  - libjuice/src/*.h
+  - -fPIC
+  - -pthread
+  - -Wno-address-of-packed-member
 extra-source-files:
   - libjuice/include/**/*.h
 
@@ -73,28 +74,12 @@ ghc-options:
     - -Werror=incomplete-uni-patterns
     - -Werror=incomplete-record-updates
 
-executables:
-  libjuice-hs:
-    dependencies:
-    - libjuice-hs
-    ghc-options:
-    - -rtsopts
-    - -threaded
-    - -with-rtsopts=-N
-    - -Wall
-    main: Main.hs
-    source-dirs: app
-    extra-source-files:
-    - CHANGELOG.md
-    - LICENSE.md
-    - README.md
-    - package.yaml
-    - stack.yaml
-
 library:
   dependencies:
   - base
   source-dirs: src
+  exposed-modules:
+    - LibJuice
 
 tests:
   tests:
