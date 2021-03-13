@@ -1,0 +1,12 @@
+; DO NOT EDIT (unless you know what you are doing)
+;
+; This subdirectory is a git "subrepo", and this file is maintained by the
+; git-subrepo command. See https://github.com/git-commands/git-subrepo#readme
+;
+[subrepo]
+	remote = https://github.com/paullouisageneau/libjuice.git
+	branch = master
+	commit = 75d0f1182382c20cb6fe4fc90c013a41c954dd47
+	parent = e218822e8885a803ec0424d9cf326a432741b556
+	method = merge
+	cmdver = 0.4.1
