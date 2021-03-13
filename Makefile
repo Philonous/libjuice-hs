@@ -16,7 +16,10 @@ $(tests): dist/tests/% : dist/libjuice-hs $(test-srcfiles) package.yaml stack.ya
 	mkdir -p dist/tests
 	cp "$(shell stack ${stack_args} path --dist-dir)/build/$(notdir $@)/$(notdir $@)" dist/tests/
 
-dist/libjuice-hs: $(srcfiles) $(test-srcfiles) package.yaml stack.yaml
+libjuice:
+	git submodule update --init --recursive
+
+dist/libjuice-hs: libjuice $(srcfiles) $(test-srcfiles) package.yaml stack.yaml
 	rm -f *.cabal
 	rm -f stack.yaml.lock
 	mkdir -p ./dist
