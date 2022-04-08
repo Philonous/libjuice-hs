@@ -19,6 +19,7 @@
 #include "addr.h"
 #include "log.h"
 
+#include <stdio.h>
 #include <string.h>
 
 socklen_t addr_get_len(const struct sockaddr *sa) {
@@ -59,7 +60,7 @@ int addr_set_port(struct sockaddr *sa, uint16_t port) {
 	}
 }
 
-bool addr_is_any(struct sockaddr *sa) {
+bool addr_is_any(const struct sockaddr *sa) {
 	switch (sa->sa_family) {
 	case AF_INET: {
 		const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
@@ -72,11 +73,17 @@ bool addr_is_any(struct sockaddr *sa) {
 	}
 	case AF_INET6: {
 		const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
-		const uint8_t *b = (const uint8_t *)&sin6->sin6_addr;
-		for (int i = 0; i < 16; ++i)
-			if (b[i] != 0)
-				return false;
-
+		if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+			const uint8_t *b = (const uint8_t *)&sin6->sin6_addr + 12;
+			for (int i = 0; i < 4; ++i)
+				if (b[i] != 0)
+					return false;
+		} else {
+			const uint8_t *b = (const uint8_t *)&sin6->sin6_addr;
+			for (int i = 0; i < 16; ++i)
+				if (b[i] != 0)
+					return false;
+		}
 		return true;
 	}
 	default:
@@ -84,7 +91,7 @@ bool addr_is_any(struct sockaddr *sa) {
 	}
 }
 
-bool addr_is_local(struct sockaddr *sa) {
+bool addr_is_local(const struct sockaddr *sa) {
 	switch (sa->sa_family) {
 	case AF_INET: {
 		const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
@@ -116,16 +123,6 @@ bool addr_is_local(struct sockaddr *sa) {
 	default:
 		return false;
 	}
-}
-
-bool addr_is_temp_inet6(struct sockaddr *sa) {
-	if (sa->sa_family != AF_INET6)
-		return false;
-	if (addr_is_local(sa))
-		return false;
-	const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
-	const uint8_t *b = (const uint8_t *)&sin6->sin6_addr;
-	return (b[8] & 0x02) ? false : true;
 }
 
 bool addr_unmap_inet6_v4mapped(struct sockaddr *sa, socklen_t *len) {
@@ -196,6 +193,31 @@ bool addr_is_equal(const struct sockaddr *a, const struct sockaddr *b, bool comp
 	}
 
 	return true;
+}
+
+int addr_to_string(const struct sockaddr *sa, char *buffer, size_t size) {
+	socklen_t salen = addr_get_len(sa);
+	if (salen == 0)
+		goto error;
+
+	char host[ADDR_MAX_NUMERICHOST_LEN];
+	char service[ADDR_MAX_NUMERICSERV_LEN];
+	if (getnameinfo(sa, salen, host, ADDR_MAX_NUMERICHOST_LEN, service, ADDR_MAX_NUMERICSERV_LEN,
+	                NI_NUMERICHOST | NI_NUMERICSERV | NI_DGRAM)) {
+		JLOG_ERROR("getnameinfo failed, errno=%d", sockerrno);
+		goto error;
+	}
+
+	int len = snprintf(buffer, size, "%s:%s", host, service);
+	if (len < 0 || (size_t)len >= size)
+		goto error;
+
+	return len;
+
+error:
+	// Make sure we still write a valid null-terminated string
+	snprintf(buffer, size, "?");
+	return -1;
 }
 
 // djb2 hash function
@@ -272,6 +294,10 @@ int addr_resolve(const char *hostname, const char *service, addr_record_t *recor
 bool addr_record_is_equal(const addr_record_t *a, const addr_record_t *b, bool compare_ports) {
 	return addr_is_equal((const struct sockaddr *)&a->addr, (const struct sockaddr *)&b->addr,
 	                     compare_ports);
+}
+
+int addr_record_to_string(const addr_record_t *record, char *buffer, size_t size) {
+	return addr_to_string((const struct sockaddr *)&record->addr, buffer, size);
 }
 
 unsigned long addr_record_hash(const addr_record_t *record, bool with_port) {

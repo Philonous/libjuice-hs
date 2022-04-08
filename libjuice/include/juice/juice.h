@@ -27,10 +27,16 @@ extern "C" {
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef JUICE_HAS_EXPORT_HEADER
+#include "juice_export.h"
+#endif
+
+#ifndef JUICE_EXPORT
 #ifdef _WIN32
 #define JUICE_EXPORT __declspec(dllexport)
 #else
 #define JUICE_EXPORT
+#endif
 #endif
 
 #define JUICE_ERR_SUCCESS 0
@@ -40,7 +46,7 @@ extern "C" {
 
 // ICE Agent
 
-#define JUICE_MAX_ADDRESS_STRING_LEN 56
+#define JUICE_MAX_ADDRESS_STRING_LEN 64
 #define JUICE_MAX_CANDIDATE_SDP_STRING_LEN 256
 #define JUICE_MAX_SDP_STRING_LEN 4096
 
@@ -75,6 +81,8 @@ typedef struct juice_config {
 	juice_turn_server_t *turn_servers;
 	int turn_servers_count;
 
+	const char *bind_address;
+
 	uint16_t local_port_range_begin;
 	uint16_t local_port_range_end;
 
@@ -103,7 +111,6 @@ JUICE_EXPORT int juice_get_selected_candidates(juice_agent_t *agent, char *local
 JUICE_EXPORT int juice_get_selected_addresses(juice_agent_t *agent, char *local, size_t local_size,
                                               char *remote, size_t remote_size);
 JUICE_EXPORT const char *juice_state_to_string(juice_state_t state);
-
 
 // ICE server
 
@@ -137,7 +144,9 @@ JUICE_EXPORT juice_server_t *juice_server_create(const juice_server_config_t *co
 JUICE_EXPORT void juice_server_destroy(juice_server_t *server);
 
 JUICE_EXPORT uint16_t juice_server_get_port(juice_server_t *server);
-
+JUICE_EXPORT int juice_server_add_credentials(juice_server_t *server,
+                                              const juice_server_credentials_t *credentials,
+                                              unsigned long lifetime_ms);
 
 // Logging
 

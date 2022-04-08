@@ -17,16 +17,12 @@
  */
 
 #include "log.h"
-#include "thread.h" // for mutexes
+#include "thread.h" // for mutexes and atomics
 
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-
-#ifndef NO_ATOMICS
-#include <stdatomic.h>
-#endif
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -47,11 +43,7 @@ static const char *log_level_colors[] = {
 
 static mutex_t log_mutex = MUTEX_INITIALIZER;
 static volatile juice_log_cb_t log_cb = NULL;
-#ifdef NO_ATOMICS
-static volatile juice_log_level_t log_level = JUICE_LOG_LEVEL_WARN;
-#else
-static _Atomic(juice_log_level_t) log_level = JUICE_LOG_LEVEL_WARN;
-#endif
+static atomic(juice_log_level_t) log_level = ATOMIC_VAR_INIT(JUICE_LOG_LEVEL_WARN);
 
 static bool use_color(void) {
 #ifdef _WIN32
@@ -61,15 +53,16 @@ static bool use_color(void) {
 #endif
 }
 
-JUICE_EXPORT void juice_set_log_level(juice_log_level_t level) {
-#ifdef NO_ATOMICS
-	mutex_lock(&log_mutex);
-	log_level = level;
-	mutex_unlock(&log_mutex);
-#else
-	atomic_store(&log_level, level);
+static int get_localtime(const time_t *t, struct tm *buf) {
+#ifdef _WIN32
+	// Windows does not have POSIX localtime_r...
+	return localtime_s(buf, t) == 0 ? 0 : -1;
+#else // POSIX
+	return localtime_r(t, buf) != NULL ? 0 : -1;
 #endif
 }
+
+JUICE_EXPORT void juice_set_log_level(juice_log_level_t level) { atomic_store(&log_level, level); }
 
 JUICE_EXPORT void juice_set_log_handler(juice_log_cb_t cb) {
 	mutex_lock(&log_mutex);
@@ -77,49 +70,59 @@ JUICE_EXPORT void juice_set_log_handler(juice_log_cb_t cb) {
 	mutex_unlock(&log_mutex);
 }
 
+bool juice_log_is_enabled(juice_log_level_t level) {
+	return level != JUICE_LOG_LEVEL_NONE && level >= atomic_load(&log_level);
+}
+
 void juice_log_write(juice_log_level_t level, const char *file, int line, const char *fmt, ...) {
-#ifdef NO_ATOMICS
-	mutex_lock(&log_mutex);
-	if (level < log_level) {
-		mutex_unlock(&log_mutex);
-		return;
-	}
-#else
-	if (level < atomic_load(&log_level) || level == JUICE_LOG_LEVEL_NONE)
+	if (!juice_log_is_enabled(level))
 		return;
 
 	mutex_lock(&log_mutex);
-#endif
 
+#if !RELEASE
 	const char *filename = file + strlen(file);
 	while (filename != file && *filename != '/' && *filename != '\\')
 		--filename;
 	if (filename != file)
 		++filename;
+#else
+	(void)file;
+	(void)line;
+#endif
 
 	if (log_cb) {
 		char message[BUFFER_SIZE];
-		int len = snprintf(message, BUFFER_SIZE, "%s:%d: ", filename, line);
-		len = len >= 0 ? len : 0;
+		int len = 0;
+#if !RELEASE
+		len = snprintf(message, BUFFER_SIZE, "%s:%d: ", filename, line);
+		if (len < 0)
+			return;
+#endif
+		if (len < BUFFER_SIZE) {
+			va_list args;
+			va_start(args, fmt);
+			vsnprintf(message + len, BUFFER_SIZE - len, fmt, args);
+			va_end(args);
+		}
 
-		va_list args;
-		va_start(args, fmt);
-		len = vsnprintf(message + len, BUFFER_SIZE - len, fmt, args);
-		va_end(args);
+		log_cb(level, message);
 
-		if (len >= 0)
-			log_cb(level, message);
 	} else {
 		time_t t = time(NULL);
-		struct tm *lt = localtime(&t);
+		struct tm lt;
 		char buffer[16];
-		if (strftime(buffer, 16, "%H:%M:%S", lt) == 0)
+		if (get_localtime(&t, &lt) != 0 || strftime(buffer, 16, "%H:%M:%S", &lt) == 0)
 			buffer[0] = '\0';
 
 		if (use_color())
 			fprintf(stdout, "%s", log_level_colors[level]);
 
-		fprintf(stdout, "%s %-7s %s:%d: ", buffer, log_level_names[level], filename, line);
+		fprintf(stdout, "%s %-7s ", buffer, log_level_names[level]);
+
+#if !RELEASE
+		fprintf(stdout, "%s:%d: ", filename, line);
+#endif
 
 		va_list args;
 		va_start(args, fmt);

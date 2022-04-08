@@ -1,10 +1,20 @@
 # libjuice - UDP Interactive Connectivity Establishment
 
+[![Build and test](https://github.com/paullouisageneau/libjuice/actions/workflows/build.yml/badge.svg)](https://github.com/paullouisageneau/libjuice/actions/workflows/build.yml)
+[![Join the chat at https://gitter.im/libjuice/community](https://badges.gitter.im/libjuice/community.svg)](https://gitter.im/libjuice/community?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
+[![Discord](https://img.shields.io/discord/903257095539925006?logo=discord)](https://discord.gg/jXAP8jp3Nn)
+[![AUR package](https://repology.org/badge/version-for-repo/aur/libjuice.svg)](https://repology.org/project/libjuice/versions)
+[![Vcpkg package](https://repology.org/badge/version-for-repo/vcpkg/libjuice.svg)](https://repology.org/project/libjuice/versions)
+
 libjuice :lemon::sweat_drops: (_JUICE is a UDP Interactive Connectivity Establishment library_) allows to open bidirectionnal User Datagram Protocol (UDP) streams with Network Address Translator (NAT) traversal.
 
-The library is a simplified implementation of the Interactive Connectivity Establishment (ICE) protocol written in pure C without dependencies for POSIX platforms (including Linux and Apple macOS) and Microsoft Windows. It supports only a single component over UDP per session in a standard single-gateway network topology, as this should be sufficient for the majority of use cases nowadays.
+The library is a simplified implementation of the Interactive Connectivity Establishment (ICE) protocol, client-side and server-side, written in C without dependencies for POSIX platforms (including GNU/Linux, Android, Apple macOS and iOS) and Microsoft Windows. The client supports only a single component over UDP per session in a standard single-gateway network topology, as this should be sufficient for the majority of use cases nowadays.
 
-Licensed under LGPLv2, see [LICENSE](https://github.com/paullouisageneau/libjuice/blob/master/LICENSE).
+libjuice is licensed under LGPLv2, see [LICENSE](https://github.com/paullouisageneau/libjuice/blob/master/LICENSE).
+
+libjuice is available on [AUR](https://aur.archlinux.org/packages/libjuice/) and [vcpkg](https://vcpkg.info/port/libjuice). Bindings are available for [Rust](https://github.com/VollmondT/juice-rs).
+
+For a STUN/TURN server application based on libjuice, see [Violet](https://github.com/paullouisageneau/violet).
 
 ## Compatibility
 
@@ -13,11 +23,9 @@ The library implements a simplified but fully compatible ICE agent ([RFC8445](ht
 The limitations compared to a fully-featured ICE agent are:
 - Only UDP is supported as transport protocol. Other protocols are ignored.
 - Only one component is supported. This is sufficient for WebRTC Data Channels or multiplexed RTP/RTCP ([RFC5731](https://tools.ietf.org/html/rfc5761)).
-- Candidates are gathered without binding to specific network interfaces. This should behave identically to the full implementation on most client systems and allows to greatly reduce complexity.
+- Candidates are gathered without binding to each network interface, which behaves identically to the full implementation on most client systems.
 
 It also implements a lightweight STUN/TURN server ([RFC8489](https://tools.ietf.org/html/rfc8489) and [RFC8656](https://tools.ietf.org/html/rfc8656)). The server can be disabled at compile-time with the `NO_SERVER` flag.
-
-For a STUN/TURN server application based on libjuice, see [Violet](https://github.com/paullouisageneau/violet).
 
 ## Dependencies
 

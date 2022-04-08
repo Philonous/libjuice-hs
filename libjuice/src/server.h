@@ -21,10 +21,6 @@
 
 #ifndef NO_SERVER
 
-#ifdef __STDC_NO_ATOMICS__
-#define NO_ATOMICS
-#endif
-
 #include "addr.h"
 #include "juice.h"
 #include "socket.h"
@@ -37,7 +33,7 @@
 #include <stdint.h>
 
 #define SERVER_DEFAULT_REALM "libjuice"
-#define SERVER_DEFAULT_MAX_ALLOCATIONS 1024
+#define SERVER_DEFAULT_MAX_ALLOCATIONS 1000 // should be 1024-1 or less to be safe for poll()
 #define SERVER_DEFAULT_MAX_PEERS 16
 
 #define SERVER_NONCE_KEY_SIZE 32
@@ -62,9 +58,16 @@ typedef struct server_turn_alloc {
 	turn_map_t map;
 } server_turn_alloc_t;
 
+typedef struct juice_credentials_list {
+	struct juice_credentials_list *next;
+	juice_server_credentials_t credentials;
+	uint8_t userhash[USERHASH_SIZE];
+	timestamp_t timestamp;
+} juice_credentials_list_t;
+
 typedef struct juice_server {
-	juice_server_config_t config;
-	uint8_t **credentials_userhash;
+	juice_server_config_t config;          // Note config.credentials will be empty
+	juice_credentials_list_t *credentials; // Credentials are stored in this list
 	uint8_t nonce_key[SERVER_NONCE_KEY_SIZE];
 	timestamp_t nonce_key_timestamp;
 	socket_t sock;
@@ -80,6 +83,12 @@ void server_do_destroy(juice_server_t *server);
 void server_destroy(juice_server_t *server);
 
 uint16_t server_get_port(juice_server_t *server);
+int server_add_credentials(juice_server_t *server, const juice_server_credentials_t *credentials,
+                           timediff_t lifetime);
+
+juice_credentials_list_t *server_do_add_credentials(juice_server_t *server,
+                                                    const juice_server_credentials_t *credentials,
+                                                    timediff_t lifetime); // internal
 
 void server_run(juice_server_t *server);
 int server_send(juice_server_t *agent, const addr_record_t *dst, const char *data, size_t size);
@@ -104,6 +113,8 @@ int server_answer_stun_error(juice_server_t *server, const uint8_t *transaction_
                              const addr_record_t *src, stun_method_t method, unsigned int code,
                              const juice_server_credentials_t *credentials);
 
+int server_process_stun_binding(juice_server_t *server, const stun_message_t *msg,
+                                const addr_record_t *src);
 int server_process_turn_allocate(juice_server_t *server, const stun_message_t *msg,
                                  const addr_record_t *src, juice_server_credentials_t *credentials);
 int server_process_turn_create_permission(juice_server_t *server, const stun_message_t *msg,

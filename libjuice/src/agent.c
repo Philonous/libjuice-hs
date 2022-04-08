@@ -114,16 +114,19 @@ juice_agent_t *agent_create(const juice_config_t *config) {
 		}
 	}
 
+	if (agent->config.bind_address) {
+		agent->config.bind_address = alloc_string_copy(agent->config.bind_address);
+		if (!agent->config.bind_address) {
+			JLOG_FATAL("alloc for bind address failed");
+			goto error;
+		}
+	}
+
 	agent->state = JUICE_STATE_DISCONNECTED;
 	agent->mode = AGENT_MODE_UNKNOWN;
 	agent->sock = INVALID_SOCKET;
 	agent->send_ds = 0;
-
-#ifdef NO_ATOMICS
-	agent->selected_entry = NULL;
-#else
-	atomic_init(&agent->selected_entry, NULL);
-#endif
+	agent->selected_entry = ATOMIC_VAR_INIT(NULL);
 
 	ice_create_local_description(&agent->local);
 
@@ -164,12 +167,13 @@ void agent_do_destroy(juice_agent_t *agent) {
 	// Free strings in config
 	free((void *)agent->config.stun_server_host);
 	for (int i = 0; i < agent->config.turn_servers_count; ++i) {
-		juice_turn_server_t *stun_server = agent->config.turn_servers + i;
-		free((void *)stun_server->host);
-		free((void *)stun_server->username);
-		free((void *)stun_server->password);
+		juice_turn_server_t *turn_server = agent->config.turn_servers + i;
+		free((void *)turn_server->host);
+		free((void *)turn_server->username);
+		free((void *)turn_server->password);
 	}
 	free(agent->config.turn_servers);
+	free((void *)agent->config.bind_address);
 	free(agent);
 
 #ifdef _WIN32
@@ -208,6 +212,7 @@ int agent_gather_candidates(juice_agent_t *agent) {
 
 	udp_socket_config_t socket_config;
 	memset(&socket_config, 0, sizeof(socket_config));
+	socket_config.bind_address = agent->config.bind_address;
 	socket_config.port_begin = agent->config.local_port_range_begin;
 	socket_config.port_end = agent->config.local_port_range_end;
 	agent->sock = udp_create_socket(&socket_config);
@@ -231,7 +236,8 @@ int agent_gather_candidates(juice_agent_t *agent) {
 	JLOG_VERBOSE("Adding %d local host candidates", records_count);
 	for (int i = 0; i < records_count; ++i) {
 		ice_candidate_t candidate;
-		if (ice_create_local_candidate(ICE_CANDIDATE_TYPE_HOST, 1, records + i, &candidate)) {
+		if (ice_create_local_candidate(ICE_CANDIDATE_TYPE_HOST, 1, agent->local.candidates_count,
+		                               records + i, &candidate)) {
 			JLOG_ERROR("Failed to create host candidate");
 			continue;
 		}
@@ -371,23 +377,14 @@ int agent_set_remote_gathering_done(juice_agent_t *agent) {
 }
 
 int agent_send(juice_agent_t *agent, const char *data, size_t size, int ds) {
-	// For performance reasons, try not to lock the global mutex if the platform has atomics
-#ifdef NO_ATOMICS
-	mutex_lock(&agent->mutex);
-	agent_stun_entry_t *selected_entry = agent->selected_entry;
-	if (selected_entry)
-		selected_entry->armed = false; // so keepalive will be rescheduled
-	mutex_unlock(&agent->mutex);
-#else
+	// Try not to lock the global mutex in the send path
 	agent_stun_entry_t *selected_entry = atomic_load(&agent->selected_entry);
-	if (selected_entry)
-		atomic_flag_clear(&selected_entry->armed); // so keepalive will be rescheduled
-#endif
-
 	if (!selected_entry) {
 		JLOG_ERROR("Send called before ICE is connected");
 		return -1;
 	}
+
+	atomic_store(&selected_entry->armed, false); // so keepalive will be rescheduled
 
 	if (selected_entry->relay_entry) {
 		// The datagram should be sent through the relay, use a channel to minimize overhead
@@ -415,16 +412,13 @@ int agent_direct_send(juice_agent_t *agent, const addr_record_t *dst, const char
 
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
-#if defined(_WIN32) || defined(__APPLE__)
-	addr_record_t tmp = *dst;
-	addr_map_inet6_v4mapped(&tmp.addr, &tmp.len);
-	int ret = sendto(agent->sock, data, (int)size, 0, (const struct sockaddr *)&tmp.addr, tmp.len);
-#else
-	int ret = sendto(agent->sock, data, size, 0, (const struct sockaddr *)&dst->addr, dst->len);
-#endif
-	if (ret < 0 && sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
-		JLOG_WARN("Send failed, errno=%d", sockerrno);
-
+	int ret = udp_sendto(agent->sock, data, size, dst);
+	if (ret < 0) {
+		if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK)
+			JLOG_INFO("Send failed, buffer is full");
+		else
+			JLOG_WARN("Send failed, errno=%d", sockerrno);
+	}
 	mutex_unlock(&agent->send_mutex);
 	return ret;
 }
@@ -452,7 +446,6 @@ int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr
 	msg.peer = *dst;
 	msg.data = data;
 	msg.data_size = size;
-	msg.dont_fragment = true;
 
 	char buffer[BUFFER_SIZE];
 	size = stun_write(buffer, BUFFER_SIZE, &msg, NULL); // no password
@@ -460,11 +453,8 @@ int agent_relay_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr
 		JLOG_ERROR("STUN message write failed");
 		return -1;
 	}
-	if (agent_direct_send(agent, &entry->record, buffer, size, ds) < 0) {
-		JLOG_WARN("STUN message send failed, errno=%d", sockerrno);
-		return -1;
-	}
-	return 0;
+
+	return agent_direct_send(agent, &entry->record, buffer, size, ds);
 }
 
 int agent_channel_send(juice_agent_t *agent, agent_stun_entry_t *entry, const addr_record_t *record,
@@ -489,11 +479,8 @@ int agent_channel_send(juice_agent_t *agent, agent_stun_entry_t *entry, const ad
 		JLOG_ERROR("TURN ChannelData wrapping failed");
 		return -1;
 	}
-	if (agent_direct_send(agent, &entry->record, buffer, len, ds) < 0) {
-		JLOG_WARN("ChannelData message send failed, errno=%d", sockerrno);
-		return -1;
-	}
-	return 0;
+
+	return agent_direct_send(agent, &entry->record, buffer, len, ds);
 }
 
 juice_state_t agent_get_state(juice_agent_t *agent) {
@@ -567,6 +554,7 @@ void agent_run(juice_agent_t *agent) {
 					entry->state = AGENT_STUN_ENTRY_STATE_PENDING;
 					entry->pair = NULL;
 					entry->record = *record;
+					entry->turn_redirections = 0;
 					entry->turn = calloc(1, sizeof(agent_turn_state_t));
 					if (!entry->turn) {
 						JLOG_ERROR("calloc for TURN state failed");
@@ -637,27 +625,21 @@ void agent_run(juice_agent_t *agent) {
 		if (timediff < 0)
 			timediff = 0;
 
-		JLOG_VERBOSE("Setting select timeout to %ld ms", (long)timediff);
-		struct timeval timeout;
-		timeout.tv_sec = (long)(timediff / 1000);
-		timeout.tv_usec = (long)((timediff % 1000) * 1000);
+		struct pollfd pfd[1];
+		pfd[0].fd = agent->sock;
+		pfd[0].events = POLLIN;
 
-		fd_set readfds;
-		FD_ZERO(&readfds);
-		FD_SET(agent->sock, &readfds);
-		int n = SOCKET_TO_INT(agent->sock) + 1;
-
-		JLOG_VERBOSE("Entering select");
+		JLOG_VERBOSE("Entering poll for %d ms", (int)timediff);
 		mutex_unlock(&agent->mutex);
-		int ret = select(n, &readfds, NULL, NULL, &timeout);
+		int ret = poll(pfd, 1, (int)timediff);
 		mutex_lock(&agent->mutex);
-		JLOG_VERBOSE("Leaving select");
+		JLOG_VERBOSE("Leaving poll");
 		if (ret < 0) {
 			if (sockerrno == SEINTR || sockerrno == SEAGAIN) {
-				JLOG_VERBOSE("select interrupted");
+				JLOG_VERBOSE("poll interrupted");
 				continue;
 			} else {
-				JLOG_FATAL("select failed, errno=%d", sockerrno);
+				JLOG_FATAL("poll failed, errno=%d", sockerrno);
 				break;
 			}
 		}
@@ -667,7 +649,12 @@ void agent_run(juice_agent_t *agent) {
 			break;
 		}
 
-		if (FD_ISSET(agent->sock, &readfds)) {
+		if (pfd[0].revents & POLLNVAL || pfd[0].revents & POLLERR) {
+			JLOG_FATAL("Error when polling socket");
+			break;
+		}
+
+		if (pfd[0].revents & POLLIN) {
 			if (agent_recv(agent) < 0)
 				break;
 		}
@@ -682,21 +669,8 @@ int agent_recv(juice_agent_t *agent) {
 	while (true) {
 		char buffer[BUFFER_SIZE];
 		addr_record_t record;
-		record.len = sizeof(record.addr);
-		int len = recvfrom(agent->sock, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&record.addr,
-		                   &record.len);
+		int len = udp_recvfrom(agent->sock, buffer, BUFFER_SIZE, &record);
 		if (len < 0) {
-			if (sockerrno == SECONNRESET || sockerrno == SENETRESET || sockerrno == SECONNREFUSED) {
-				// On Windows, if a UDP socket receives an ICMP port unreachable response after
-				// sending a datagram, this error is stored, and the next call to recvfrom() returns
-				// WSAECONNRESET (port unreachable) or WSAENETRESET (TTL expired).
-				// Therefore, it may be ignored.
-				JLOG_DEBUG("Ignoring %s returned by recvfrom",
-				           sockerrno == SECONNRESET
-				               ? "ECONNRESET"
-				               : (sockerrno == SENETRESET ? "ENETRESET" : "ECONNREFUSED"));
-				continue;
-			}
 			if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK) {
 				JLOG_VERBOSE("No more datagrams to receive");
 				break;
@@ -721,7 +695,17 @@ int agent_input(juice_agent_t *agent, char *buf, size_t len, const addr_record_t
 	JLOG_VERBOSE("Received datagram, size=%d", len);
 
 	if (is_stun_datagram(buf, len)) {
-		JLOG_DEBUG("Received STUN datagram%s", relayed ? " via relay" : "");
+		if (JLOG_DEBUG_ENABLED) {
+			char src_str[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(src, src_str, ADDR_MAX_STRING_LEN);
+			if (relayed) {
+				char relayed_str[ADDR_MAX_STRING_LEN];
+				addr_record_to_string(relayed, relayed_str, ADDR_MAX_STRING_LEN);
+				JLOG_DEBUG("Received STUN datagram from %s relayed via %s", src_str, relayed_str);
+			} else {
+				JLOG_DEBUG("Received STUN datagram from %s", src_str);
+			}
+		}
 		stun_message_t msg;
 		if (stun_read(buf, len, &msg) < 0) {
 			JLOG_ERROR("STUN message reading failed");
@@ -730,7 +714,17 @@ int agent_input(juice_agent_t *agent, char *buf, size_t len, const addr_record_t
 		return agent_dispatch_stun(agent, buf, len, &msg, src, relayed);
 	}
 
-	JLOG_DEBUG("Received non-STUN datagram%s", relayed ? " via relay" : "");
+	if (JLOG_DEBUG_ENABLED) {
+		char src_str[ADDR_MAX_STRING_LEN];
+		addr_record_to_string(src, src_str, ADDR_MAX_STRING_LEN);
+		if (relayed) {
+			char relayed_str[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(relayed, relayed_str, ADDR_MAX_STRING_LEN);
+			JLOG_DEBUG("Received non-STUN datagram from %s relayed via %s", src_str, relayed_str);
+		} else {
+			JLOG_DEBUG("Received non-STUN datagram from %s", src_str);
+		}
+	}
 	agent_stun_entry_t *entry = agent_find_entry_from_record(agent, src, relayed);
 	if (!entry) {
 		JLOG_WARN("Received a datagram from unknown address, ignoring");
@@ -766,18 +760,17 @@ int agent_interrupt(juice_agent_t *agent) {
 		return -1;
 	}
 
-	addr_record_t local;
-	if (udp_get_local_addr(agent->sock, AF_INET, &local) < 0) {
-		mutex_unlock(&agent->mutex);
-		return -1;
+	mutex_lock(&agent->send_mutex);
+	if (udp_sendto_self(agent->sock, NULL, 0) < 0) {
+		if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK) {
+			JLOG_WARN("Failed to interrupt thread by triggering socket, errno=%d", sockerrno);
+			mutex_unlock(&agent->send_mutex);
+			mutex_unlock(&agent->mutex);
+			return -1;
+		}
 	}
 
-	if (agent_direct_send(agent, &local, NULL, 0, 0) < 0) {
-		JLOG_WARN("Failed to interrupt thread by triggering socket, errno=%d", sockerrno);
-		mutex_unlock(&agent->mutex);
-		return -1;
-	}
-
+	mutex_unlock(&agent->send_mutex);
 	mutex_unlock(&agent->mutex);
 	return 0;
 }
@@ -807,16 +800,22 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 				continue;
 
 			if (entry->retransmissions >= 0) {
-				JLOG_DEBUG("STUN entry %d: Sending request (%d retransmissions left)", i,
-				           entry->retransmissions);
-
+				if (JLOG_DEBUG_ENABLED) {
+					char record_str[ADDR_MAX_STRING_LEN];
+					addr_record_to_string(&entry->record, record_str, ADDR_MAX_STRING_LEN);
+					JLOG_DEBUG("STUN entry %d: Sending request to %s (%d retransmissions left)", i,
+					           record_str, entry->retransmissions);
+				}
 				int ret;
-				if (entry->type == AGENT_STUN_ENTRY_TYPE_RELAY)
-					// TURN server
+				switch (entry->type) {
+				case AGENT_STUN_ENTRY_TYPE_RELAY:
 					ret = agent_send_turn_allocate_request(agent, entry, STUN_METHOD_ALLOCATE);
-				else
-					// STUN server or peer
+					break;
+
+				default:
 					ret = agent_send_stun_binding(agent, entry, STUN_CLASS_REQUEST, 0, NULL, NULL);
+					break;
+				}
 
 				if (ret >= 0) {
 					--entry->retransmissions;
@@ -830,29 +829,30 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 			JLOG_DEBUG("STUN entry %d: Failed", i);
 			entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
 			entry->next_transmission = 0;
-			if (entry->pair)
-				entry->pair->state = ICE_CANDIDATE_PAIR_STATE_FAILED;
 
-			if (entry->type == AGENT_STUN_ENTRY_TYPE_RELAY) {
-				// TURN server
+			switch (entry->type) {
+			case AGENT_STUN_ENTRY_TYPE_RELAY:
 				JLOG_INFO("TURN allocation failed");
 				agent_update_gathering_done(agent);
+				break;
 
-			} else if (entry->type == AGENT_STUN_ENTRY_TYPE_SERVER) {
-				// STUN server
-				JLOG_INFO("STUN binding failed");
+			case AGENT_STUN_ENTRY_TYPE_SERVER:
+				JLOG_INFO("STUN server binding failed");
 				agent_update_gathering_done(agent);
+				break;
+
+			default:
+				if (entry->pair) {
+					JLOG_DEBUG("Candidate pair check failed");
+					entry->pair->state = ICE_CANDIDATE_PAIR_STATE_FAILED;
+				}
+				break;
 			}
 		}
 		// STUN keepalives
-		// RFC 8445 11. Keepalives: All endpoints MUST send keepalives for each data session.
 		else if (entry->state == AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE) {
-#ifdef NO_ATOMICS
-			bool must_arm = !entry->armed;
-#else
-			bool must_arm = !atomic_flag_test_and_set(&entry->armed);
-#endif
-			if (must_arm) {
+			bool armed = atomic_load(&entry->armed);
+			if (!armed) {
 				JLOG_VERBOSE("STUN entry %d: Must be rearmed", i);
 				agent_arm_transmission(agent, entry, STUN_KEEPALIVE_PERIOD);
 			}
@@ -862,19 +862,36 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 
 			JLOG_DEBUG("STUN entry %d: Sending keepalive", i);
 			int ret;
-			if (entry->type == AGENT_STUN_ENTRY_TYPE_RELAY)
-				// TURN server
+			switch (entry->type) {
+			case AGENT_STUN_ENTRY_TYPE_RELAY:
+				// RFC 8445 5.1.1.4. Keeping Candidates Alive:
+				// Refreshes for allocations are done using the Refresh transaction, as described in
+				// [RFC5766]
 				ret = agent_send_turn_allocate_request(agent, entry, STUN_METHOD_REFRESH);
-			else
-				// STUN server or peer
+				break;
+			case AGENT_STUN_ENTRY_TYPE_SERVER:
+				// RFC 8445 5.1.1.4. Keeping Candidates Alive:
+				// For server-reflexive candidates learned through a Binding request, the bindings
+				// MUST be kept alive by additional Binding requests to the server.
+				ret = agent_send_stun_binding(agent, entry, STUN_CLASS_REQUEST, 0, NULL, NULL);
+				break;
+			default:
+				// RFC 8445 11. Keepalives:
+				// All endpoints MUST send keepalives for each data session. [...] STUN keepalives
+				// MUST be used when an ICE agent is a full ICE implementation and is communicating
+				// with a peer that supports ICE (lite or full). [...] When STUN is being used for
+				// keepalives, a STUN Binding Indication is used [RFC5389].
 				ret = agent_send_stun_binding(agent, entry, STUN_CLASS_INDICATION, 0, NULL, NULL);
-
-			if (ret < 0) {
-				JLOG_ERROR("Sending keepalive failed");
-				continue;
+				break;
 			}
 
-			agent_arm_transmission(agent, entry, STUN_KEEPALIVE_PERIOD);
+			if (ret < 0)
+				JLOG_WARN("Sending keepalive failed");
+
+			agent_arm_transmission(agent, entry,
+			                       entry->type == AGENT_STUN_ENTRY_TYPE_RELAY && ret >= 0
+			                           ? TURN_REFRESH_PERIOD
+			                           : STUN_KEEPALIVE_PERIOD);
 
 		} else {
 			// Entry does not transmit, unset next transmission
@@ -933,11 +950,7 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 			for (int i = 0; i < agent->entries_count; ++i) {
 				agent_stun_entry_t *entry = agent->entries + i;
 				if (entry->pair == selected_pair) {
-#ifdef NO_ATOMICS
-					agent->selected_entry = entry;
-#else
 					atomic_store(&agent->selected_entry, entry);
-#endif
 					break;
 				}
 			}
@@ -962,27 +975,37 @@ int agent_bookkeeping(juice_agent_t *agent, timestamp_t *next_timestamp) {
 			if (agent->mode == AGENT_MODE_CONTROLLED || pending_count == 0)
 				agent_change_state(agent, JUICE_STATE_COMPLETED);
 
-			// Enable keepalive only for the entry of the nominated pair
+			agent_stun_entry_t *nominated_entry = NULL;
 			agent_stun_entry_t *relay_entry = NULL;
 			for (int i = 0; i < agent->entries_count; ++i) {
 				agent_stun_entry_t *entry = agent->entries + i;
 				if (entry->pair && entry->pair == nominated_pair) {
-					relay_entry = entry->relay_entry;
-					if (entry->state != AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE) {
-						entry->state = AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE;
-						agent_arm_transmission(agent, entry, STUN_KEEPALIVE_PERIOD);
-					}
-				} else {
-					if (entry->state == AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE)
-						entry->state = AGENT_STUN_ENTRY_STATE_SUCCEEDED;
+					nominated_entry = entry;
+					relay_entry = nominated_entry->relay_entry;
+					break;
 				}
 			}
 
-			// If the entry of the nominated candidate is relayed locally, we need also to refresh
-			// the corresponding TURN session regularly
-			if (relay_entry) {
+			// Enable keepalive for the entry of the nominated pair
+			if (nominated_entry &&
+			    nominated_entry->state != AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE) {
+				nominated_entry->state = AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE;
+				agent_arm_transmission(agent, nominated_entry, STUN_KEEPALIVE_PERIOD);
+			}
+
+			// If the entry of the nominated candidate is relayed locally, we need also to
+			// refresh the corresponding TURN session regularly
+			if (relay_entry && relay_entry->state != AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE) {
 				relay_entry->state = AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE;
 				agent_arm_transmission(agent, relay_entry, TURN_REFRESH_PERIOD);
+			}
+
+			// Disable keepalives for other entries
+			for (int i = 0; i < agent->entries_count; ++i) {
+				agent_stun_entry_t *entry = agent->entries + i;
+				if (entry != nominated_entry && entry != relay_entry &&
+				    entry->state == AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE)
+					entry->state = AGENT_STUN_ENTRY_STATE_SUCCEEDED;
 			}
 
 		} else {
@@ -1091,7 +1114,12 @@ int agent_verify_credentials(juice_agent_t *agent, const agent_stun_entry_t *ent
                              size_t size, stun_message_t *msg) {
 	(void)agent;
 
-	if (msg->msg_class == STUN_CLASS_INDICATION || msg->msg_class == STUN_CLASS_RESP_ERROR)
+	// RFC 8489: If the response is an error response with an error code of 400 (Bad Request) and
+	// does not contain either the MESSAGE-INTEGRITY or MESSAGE-INTEGRITY-SHA256 attribute, then the
+	// response MUST be discarded, as if it were never received.  This means that retransmits, if
+	// applicable, will continue.
+	if (msg->msg_class == STUN_CLASS_INDICATION ||
+	    (msg->msg_class == STUN_CLASS_RESP_ERROR && msg->error_code != 400))
 		return 0;
 
 	if (!msg->has_integrity) {
@@ -1146,8 +1174,9 @@ int agent_dispatch_stun(juice_agent_t *agent, void *buf, size_t size, stun_messa
 				break;
 			}
 			if (agent->entries[i].turn) {
-				if (turn_find_transaction_id(&agent->entries[i].turn->map, msg->transaction_id,
-				                             NULL)) {
+				if (turn_retrieve_transaction_id(&agent->entries[i].turn->map, msg->transaction_id,
+				                                 NULL)) {
+					JLOG_VERBOSE("STUN entry %d matching incoming transaction ID (TURN)", i);
 					entry = &agent->entries[i];
 					break;
 				}
@@ -1219,8 +1248,10 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 		JLOG_DEBUG("Received STUN Binding request");
 		if (entry->type != AGENT_STUN_ENTRY_TYPE_CHECK)
 			return -1;
+
 		ice_candidate_pair_t *pair = entry->pair;
 		if (msg->ice_controlling == msg->ice_controlled) {
+			JLOG_WARN("Controlling and controlled attributes mismatch in request");
 			agent_send_stun_binding(agent, entry, STUN_CLASS_RESP_ERROR, 400, msg->transaction_id,
 			                        NULL);
 			return -1;
@@ -1314,6 +1345,13 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 
 		if (msg->mapped.len && !relayed) {
 			JLOG_VERBOSE("Response has mapped address");
+
+			if (JLOG_INFO_ENABLED && entry->type != AGENT_STUN_ENTRY_TYPE_CHECK) {
+				char mapped_str[ADDR_MAX_STRING_LEN];
+				addr_record_to_string(&msg->mapped, mapped_str, ADDR_MAX_STRING_LEN);
+				JLOG_INFO("Got STUN mapped address %s from server", mapped_str);
+			}
+
 			ice_candidate_type_t type = (entry->type == AGENT_STUN_ENTRY_TYPE_CHECK)
 			                                ? ICE_CANDIDATE_TYPE_PEER_REFLEXIVE
 			                                : ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE;
@@ -1322,10 +1360,25 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 			}
 		}
 		if (entry->type == AGENT_STUN_ENTRY_TYPE_CHECK) {
+			// 7.2.5.2.1. Non-Symmetric Transport Addresses:
+			// The ICE agent MUST check that the source and destination transport addresses in the
+			// Binding request and response are symmetric. [...] If the addresses are not symmetric,
+			// the agent MUST set the candidate pair state to Failed.
+			if (!addr_record_is_equal(src, &entry->record, true)) {
+				JLOG_DEBUG(
+				    "Candidate pair check failed (non-symmetric source address in response)");
+				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
+				break;
+			}
+
 			ice_candidate_pair_t *pair = entry->pair;
+			if (!pair) {
+				JLOG_ERROR("STUN entry for candidate pair checking has no candidate pair");
+				return -1;
+			}
 
 			if (pair->state != ICE_CANDIDATE_PAIR_STATE_SUCCEEDED) {
-				JLOG_DEBUG("Pair check succeeded");
+				JLOG_DEBUG("Candidate pair check succeeded");
 				pair->state = ICE_CANDIDATE_PAIR_STATE_SUCCEEDED;
 			}
 
@@ -1347,33 +1400,52 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 		break;
 	}
 	case STUN_CLASS_RESP_ERROR: {
-		if (msg->error_code != STUN_ERROR_INTERNAL_VALIDATION_FAILED)
-			JLOG_WARN("Got STUN Binding error response, code=%u", (unsigned int)msg->error_code);
+		if (msg->error_code != STUN_ERROR_INTERNAL_VALIDATION_FAILED) {
+			if (msg->error_code == 487)
+				JLOG_DEBUG("Got STUN Binding error response, code=%u",
+				           (unsigned int)msg->error_code);
+			else
+				JLOG_WARN("Got STUN Binding error response, code=%u",
+				          (unsigned int)msg->error_code);
+		}
 
-		if (entry->type == AGENT_STUN_ENTRY_TYPE_CHECK && msg->error_code == 487) {
-			// RFC 8445 7.2.5.1. Role Conflict:
-			// If the Binding request generates a 487 (Role Conflict) error response, and if the ICE
-			// agent included an ICE-CONTROLLED attribute in the request, the agent MUST switch to
-			// the controlling role. If the agent included an ICE-CONTROLLING attribute in the
-			// request, the agent MUST switch to the controlled role. Once the agent has switched
-			// its role, the agent MUST [...] set the candidate pair state to Waiting [and] change
-			// the tiebreaker value.
-			if ((agent->mode == AGENT_MODE_CONTROLLING && msg->ice_controlling) ||
-			    (agent->mode == AGENT_MODE_CONTROLLED && msg->ice_controlled)) {
-				JLOG_WARN("ICE role conflit");
-				JLOG_DEBUG("Switching roles to %s as requested",
-				           msg->ice_controlling ? "controlled" : "controlling");
-				agent->mode = msg->ice_controlling ? AGENT_MODE_CONTROLLED : AGENT_MODE_CONTROLLING;
-				agent_update_candidate_pairs(agent);
+		if (entry->type == AGENT_STUN_ENTRY_TYPE_CHECK) {
+			if (msg->error_code == 487) {
+				if (entry->mode == agent->mode) {
+					// RFC 8445 7.2.5.1. Role Conflict:
+					// If the Binding request generates a 487 (Role Conflict) error response, and if
+					// the ICE agent included an ICE-CONTROLLED attribute in the request, the agent
+					// MUST switch to the controlling role. If the agent included an ICE-CONTROLLING
+					// attribute in the request, the agent MUST switch to the controlled role. Once
+					// the agent has switched its role, the agent MUST [...] set the candidate pair
+					// state to Waiting [and] change the tiebreaker value.
+					JLOG_WARN("ICE role conflit");
+					JLOG_DEBUG("Switching roles to %s as requested",
+					           entry->mode == AGENT_MODE_CONTROLLING ? "controlled"
+					                                                 : "controlling");
+					agent->mode = entry->mode == AGENT_MODE_CONTROLLING ? AGENT_MODE_CONTROLLED
+					                                                    : AGENT_MODE_CONTROLLING;
+					agent_update_candidate_pairs(agent);
+
+					juice_random(&agent->ice_tiebreaker, sizeof(agent->ice_tiebreaker));
+					if (entry->state != AGENT_STUN_ENTRY_STATE_IDLE) { // Check might not be started
+						entry->state = AGENT_STUN_ENTRY_STATE_PENDING;
+						agent_arm_transmission(agent, entry, 0);
+					}
+				} else {
+					JLOG_DEBUG("Already switched roles to %s as requested",
+					           agent->mode == AGENT_MODE_CONTROLLING ? "controlling"
+					                                                 : "controlled");
+				}
+			} else {
+				// 7.2.5.2.4. Unrecoverable STUN Response:
+				// If the Binding request generates a STUN error response that is unrecoverable
+				// [RFC5389], the ICE agent SHOULD set the candidate pair state to Failed.
+				JLOG_DEBUG("Chandidate pair check failed (unrecoverable error)");
+				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
 			}
-
-			juice_random(&agent->ice_tiebreaker, sizeof(agent->ice_tiebreaker));
-
-			entry->state = AGENT_STUN_ENTRY_STATE_PENDING;
-			agent_arm_transmission(agent, entry, 0);
-
-		} else {
-			JLOG_INFO("STUN server binding failed");
+		} else { // entry->type == AGENT_STUN_ENTRY_TYPE_SERVER
+			JLOG_INFO("STUN server binding failed (unrecoverable error)");
 			entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
 			agent_update_gathering_done(agent);
 		}
@@ -1391,9 +1463,9 @@ int agent_process_stun_binding(juice_agent_t *agent, const stun_message_t *msg,
 	return 0;
 }
 
-int agent_send_stun_binding(juice_agent_t *agent, const agent_stun_entry_t *entry,
-                            stun_class_t msg_class, unsigned int error_code,
-                            const uint8_t *transaction_id, const addr_record_t *mapped) {
+int agent_send_stun_binding(juice_agent_t *agent, agent_stun_entry_t *entry, stun_class_t msg_class,
+                            unsigned int error_code, const uint8_t *transaction_id,
+                            const addr_record_t *mapped) {
 	// Send STUN Binding
 	JLOG_DEBUG("Sending STUN Binding %s",
 	           msg_class == STUN_CLASS_REQUEST
@@ -1423,22 +1495,25 @@ int agent_send_stun_binding(juice_agent_t *agent, const agent_stun_entry_t *entr
 		switch (msg_class) {
 		case STUN_CLASS_REQUEST: {
 			if (*agent->remote.ice_ufrag == '\0' || *agent->remote.ice_pwd == '\0') {
-				JLOG_ERROR("Attempted to send STUN Binding to peer without remote ICE credentials");
-				return -1;
-			}
-			// Local candidates are undifferentiated, always set the maximum priority
-			uint32_t local_priority = 0;
-			for (int i = 0; i < agent->local.candidates_count; ++i) {
-				ice_candidate_t *candidate = agent->local.candidates + i;
-				if (local_priority < candidate->priority)
-					local_priority = candidate->priority;
+				JLOG_DEBUG("Missing remote ICE credentials, dropping STUN binding request");
+				return 0;
 			}
 			snprintf(msg.credentials.username, STUN_MAX_USERNAME_LEN, "%s:%s",
 			         agent->remote.ice_ufrag, agent->local.ice_ufrag);
 			password = agent->remote.ice_pwd;
-			msg.priority = local_priority;
 			msg.ice_controlling = agent->mode == AGENT_MODE_CONTROLLING ? agent->ice_tiebreaker : 0;
 			msg.ice_controlled = agent->mode == AGENT_MODE_CONTROLLED ? agent->ice_tiebreaker : 0;
+
+			// RFC 8445 7.1.1. PRIORITY
+			// The PRIORITY attribute MUST be included in a Binding request and be set to the value
+			// computed by the algorithm in Section 5.1.2 for the local candidate, but with the
+			// candidate type preference of peer-reflexive candidates.
+			int family = entry->record.addr.ss_family;
+			int index = entry->pair && entry->pair->local
+			                ? (int)(entry->pair->local - agent->local.candidates)
+			                : 0;
+			msg.priority =
+			    ice_compute_priority(ICE_CANDIDATE_TYPE_PEER_REFLEXIVE, family, 1, index);
 
 			// RFC 8445 8.1.1. Nominating Pairs:
 			// Once the controlling agent has picked a valid pair for nomination, it repeats the
@@ -1446,6 +1521,8 @@ int agent_send_stun_binding(juice_agent_t *agent, const agent_stun_entry_t *entr
 			// USE-CANDIDATE attribute.
 			msg.use_candidate = agent->mode == AGENT_MODE_CONTROLLING && entry->pair &&
 			                    entry->pair->nomination_requested;
+
+			entry->mode = agent->mode; // save current mode in case of conflict
 			break;
 		}
 		case STUN_CLASS_RESP_SUCCESS:
@@ -1454,6 +1531,7 @@ int agent_send_stun_binding(juice_agent_t *agent, const agent_stun_entry_t *entr
 			msg.error_code = error_code;
 			if (mapped)
 				msg.mapped = *mapped;
+
 			break;
 		}
 		case STUN_CLASS_INDICATION: {
@@ -1476,12 +1554,16 @@ int agent_send_stun_binding(juice_agent_t *agent, const agent_stun_entry_t *entr
 	if (entry->relay_entry) {
 		// The datagram must be sent through the relay
 		JLOG_DEBUG("Sending STUN message via relay");
-		return agent_relay_send(agent, entry->relay_entry, &entry->record, buffer, size, 0);
+		if (agent_relay_send(agent, entry->relay_entry, &entry->record, buffer, size, 0) < 0) {
+			JLOG_WARN("STUN message send via relay failed");
+			return -1;
+		}
+		return 0;
 	}
 
 	// Direct send
 	if (agent_direct_send(agent, &entry->record, buffer, size, 0) < 0) {
-		JLOG_WARN("STUN message send failed, errno=%d", sockerrno);
+		JLOG_WARN("STUN message send failed");
 		return -1;
 	}
 	return 0;
@@ -1517,7 +1599,6 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 			break;
 		}
 
-		JLOG_INFO("TURN allocation successful");
 		if (entry->state != AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE) {
 			entry->state = AGENT_STUN_ENTRY_STATE_SUCCEEDED;
 			entry->next_transmission = 0;
@@ -1532,6 +1613,13 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 
 		if (msg->mapped.len) {
 			JLOG_VERBOSE("Response has mapped address");
+
+			if (JLOG_INFO_ENABLED) {
+				char mapped_str[ADDR_MAX_STRING_LEN];
+				addr_record_to_string(&msg->mapped, mapped_str, ADDR_MAX_STRING_LEN);
+				JLOG_INFO("Got STUN mapped address %s from TURN server", mapped_str);
+			}
+
 			if (agent_add_local_reflexive_candidate(agent, ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE,
 			                                        &msg->mapped)) {
 				JLOG_WARN("Failed to add local peer reflexive candidate from TURN mapped address");
@@ -1551,6 +1639,12 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 			return -1;
 		}
 
+		if (JLOG_INFO_ENABLED) {
+			char relayed_str[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(&entry->relayed, relayed_str, ADDR_MAX_STRING_LEN);
+			JLOG_INFO("Allocated TURN relayed address %s", relayed_str);
+		}
+
 		agent_update_gathering_done(agent);
 		break;
 	}
@@ -1561,11 +1655,13 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 			if (*entry->turn->credentials.realm != '\0') {
 				JLOG_ERROR("TURN authentication failed");
 				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
+				agent_update_gathering_done(agent);
 				return -1;
 			}
 			if (*msg->credentials.realm == '\0' || *msg->credentials.nonce == '\0') {
 				JLOG_ERROR("Expected realm and nonce in TURN error response");
 				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
+				agent_update_gathering_done(agent);
 				return -1;
 			}
 
@@ -1580,12 +1676,48 @@ int agent_process_turn_allocate(juice_agent_t *agent, const stun_message_t *msg,
 			if (*msg->credentials.realm == '\0' || *msg->credentials.nonce == '\0') {
 				JLOG_ERROR("Expected realm and nonce in TURN error response");
 				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
+				agent_update_gathering_done(agent);
 				return -1;
 			}
 
 			stun_process_credentials(&msg->credentials, &entry->turn->credentials);
 
 			// Resend request when possible
+			agent_arm_transmission(agent, entry, 0);
+
+		} else if (msg->msg_method == STUN_METHOD_ALLOCATE &&
+		           msg->error_code == 300) { // Try Alternate
+			// RFC 8489 10. ALTERNATE-SERVER Mechanism:
+			// A client using this extension handles a 300 (Try Alternate) error code as follows.
+			// The client looks for an ALTERNATE-SERVER attribute in the error response. If one is
+			// found, then the client considers the current transaction as failed and reattempts the
+			// request with the server specified in the attribute, using the same transport protocol
+			// used for the previous request.
+			if (!msg->alternate_server.len ||
+			    addr_record_is_equal(&msg->alternate_server, &entry->record, true)) {
+				JLOG_ERROR("Expected alternate server in TURN Allocate 300 Try Alternate response");
+				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
+				agent_update_gathering_done(agent);
+				return -1;
+			}
+			// Prevent infinite redirection loop
+			if (entry->turn_redirections >= MAX_TURN_REDIRECTIONS) {
+				JLOG_ERROR("Too many redirections for TURN Allocate");
+				entry->state = AGENT_STUN_ENTRY_STATE_FAILED;
+				agent_update_gathering_done(agent);
+				return -1;
+			}
+
+			if (JLOG_INFO_ENABLED) {
+				char alternate_server_str[ADDR_MAX_STRING_LEN];
+				addr_record_to_string(&msg->alternate_server, alternate_server_str,
+				                      ADDR_MAX_STRING_LEN);
+				JLOG_INFO("Trying alternate TURN server %s", alternate_server_str);
+			}
+
+			// Change record and resend request when possible
+			++entry->turn_redirections;
+			entry->record = msg->alternate_server;
 			agent_arm_transmission(agent, entry, 0);
 
 		} else {
@@ -1635,8 +1767,11 @@ int agent_send_turn_allocate_request(juice_agent_t *agent, const agent_stun_entr
 
 	msg.credentials = entry->turn->credentials;
 	msg.lifetime = TURN_LIFETIME / 1000; // seconds
-	msg.requested_transport = true;
-	msg.dont_fragment = true;
+
+	// Include allocation attributes in Allocate request only
+	if (method == STUN_METHOD_ALLOCATE) {
+		msg.requested_transport = true;
+	}
 
 	const char *password = *msg.credentials.nonce != '\0' ? entry->turn->password : NULL;
 
@@ -1647,7 +1782,7 @@ int agent_send_turn_allocate_request(juice_agent_t *agent, const agent_stun_entr
 		return -1;
 	}
 	if (agent_direct_send(agent, &entry->record, buffer, size, 0) < 0) {
-		JLOG_WARN("STUN message send failed, errno=%d", sockerrno);
+		JLOG_WARN("STUN message send failed");
 		return -1;
 	}
 	return 0;
@@ -1674,9 +1809,24 @@ int agent_process_turn_create_permission(juice_agent_t *agent, const stun_messag
 		break;
 	}
 	case STUN_CLASS_RESP_ERROR: {
-		if (msg->error_code != STUN_ERROR_INTERNAL_VALIDATION_FAILED)
+		if (msg->error_code == 438) { // Stale Nonce
+			JLOG_DEBUG("Got TURN CreatePermission Stale Nonce response");
+			if (*msg->credentials.realm == '\0' || *msg->credentials.nonce == '\0') {
+				JLOG_ERROR("Expected realm and nonce in TURN error response");
+				return -1;
+			}
+
+			stun_process_credentials(&msg->credentials, &entry->turn->credentials);
+
+			// Resend
+			addr_record_t record;
+			if (turn_retrieve_transaction_id(&entry->turn->map, msg->transaction_id, &record))
+				agent_send_turn_create_permission_request(agent, entry, &record, 0);
+
+		} else if (msg->error_code != STUN_ERROR_INTERNAL_VALIDATION_FAILED) {
 			JLOG_WARN("Got TURN CreatePermission error response, code=%u",
 			          (unsigned int)msg->error_code);
+		}
 		break;
 	}
 	default: {
@@ -1690,7 +1840,11 @@ int agent_process_turn_create_permission(juice_agent_t *agent, const stun_messag
 
 int agent_send_turn_create_permission_request(juice_agent_t *agent, agent_stun_entry_t *entry,
                                               const addr_record_t *record, int ds) {
-	JLOG_DEBUG("Sending TURN CreatePermission request");
+	if (JLOG_DEBUG_ENABLED) {
+		char record_str[ADDR_MAX_STRING_LEN];
+		addr_record_to_string(record, record_str, ADDR_MAX_STRING_LEN);
+		JLOG_DEBUG("Sending TURN CreatePermission request for %s", record_str);
+	}
 
 	if (entry->type != AGENT_STUN_ENTRY_TYPE_RELAY) {
 		JLOG_ERROR("Attempted to send a TURN CreatePermission request for a non-relay entry");
@@ -1711,7 +1865,8 @@ int agent_send_turn_create_permission_request(juice_agent_t *agent, agent_stun_e
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_class = STUN_CLASS_REQUEST;
 	msg.msg_method = STUN_METHOD_CREATE_PERMISSION;
-	turn_set_random_permission_transaction_id(&entry->turn->map, record, msg.transaction_id);
+	if (!turn_set_random_permission_transaction_id(&entry->turn->map, record, msg.transaction_id))
+		return -1;
 
 	msg.credentials = entry->turn->credentials;
 	msg.peer = *record;
@@ -1723,7 +1878,7 @@ int agent_send_turn_create_permission_request(juice_agent_t *agent, agent_stun_e
 		return -1;
 	}
 	if (agent_direct_send(agent, &entry->record, buffer, size, ds) < 0) {
-		JLOG_WARN("STUN message send failed, errno=%d", sockerrno);
+		JLOG_WARN("STUN message send failed");
 		return -1;
 	}
 	return 0;
@@ -1750,9 +1905,24 @@ int agent_process_turn_channel_bind(juice_agent_t *agent, const stun_message_t *
 		break;
 	}
 	case STUN_CLASS_RESP_ERROR: {
-		if (msg->error_code != STUN_ERROR_INTERNAL_VALIDATION_FAILED)
+		if (msg->error_code == 438) { // Stale Nonce
+			JLOG_DEBUG("Got TURN ChannelBind Stale Nonce response");
+			if (*msg->credentials.realm == '\0' || *msg->credentials.nonce == '\0') {
+				JLOG_ERROR("Expected realm and nonce in TURN error response");
+				return -1;
+			}
+
+			stun_process_credentials(&msg->credentials, &entry->turn->credentials);
+
+			// Resend
+			addr_record_t record;
+			if (turn_retrieve_transaction_id(&entry->turn->map, msg->transaction_id, &record))
+				agent_send_turn_channel_bind_request(agent, entry, &record, 0, NULL);
+
+		} else if (msg->error_code != STUN_ERROR_INTERNAL_VALIDATION_FAILED) {
 			JLOG_WARN("Got TURN ChannelBind error response, code=%u",
 			          (unsigned int)msg->error_code);
+		}
 		break;
 	}
 	default: {
@@ -1767,7 +1937,11 @@ int agent_process_turn_channel_bind(juice_agent_t *agent, const stun_message_t *
 int agent_send_turn_channel_bind_request(juice_agent_t *agent, agent_stun_entry_t *entry,
                                          const addr_record_t *record, int ds,
                                          uint16_t *out_channel) {
-	JLOG_DEBUG("Sending TURN ChannelBind request");
+	if (JLOG_DEBUG_ENABLED) {
+		char record_str[ADDR_MAX_STRING_LEN];
+		addr_record_to_string(record, record_str, ADDR_MAX_STRING_LEN);
+		JLOG_DEBUG("Sending TURN ChannelBind request for %s", record_str);
+	}
 
 	if (entry->type != AGENT_STUN_ENTRY_TYPE_RELAY) {
 		JLOG_ERROR("Attempted to send a TURN ChannelBind request for a non-relay entry");
@@ -1811,7 +1985,7 @@ int agent_send_turn_channel_bind_request(juice_agent_t *agent, agent_stun_entry_
 		return -1;
 	}
 	if (agent_direct_send(agent, &entry->record, buffer, size, ds) < 0) {
-		JLOG_WARN("STUN message send failed, errno=%d", sockerrno);
+		JLOG_WARN("STUN message send failed");
 		return -1;
 	}
 	return 0;
@@ -1873,7 +2047,8 @@ int agent_add_local_relayed_candidate(juice_agent_t *agent, const addr_record_t 
 		return 0;
 	}
 	ice_candidate_t candidate;
-	if (ice_create_local_candidate(ICE_CANDIDATE_TYPE_RELAYED, 1, record, &candidate)) {
+	if (ice_create_local_candidate(ICE_CANDIDATE_TYPE_RELAYED, 1, agent->local.candidates_count,
+	                               record, &candidate)) {
 		JLOG_ERROR("Failed to create relayed candidate");
 		return -1;
 	}
@@ -1916,7 +2091,7 @@ int agent_add_local_reflexive_candidate(juice_agent_t *agent, ice_candidate_type
 		return 0;
 	}
 	ice_candidate_t candidate;
-	if (ice_create_local_candidate(type, 1, record, &candidate)) {
+	if (ice_create_local_candidate(type, 1, agent->local.candidates_count, record, &candidate)) {
 		JLOG_ERROR("Failed to create reflexive candidate");
 		return -1;
 	}
@@ -1958,7 +2133,7 @@ int agent_add_remote_reflexive_candidate(juice_agent_t *agent, ice_candidate_typ
 		return 0;
 	}
 	ice_candidate_t candidate;
-	if (ice_create_local_candidate(type, 1, record, &candidate)) {
+	if (ice_create_local_candidate(type, 1, agent->local.candidates_count, record, &candidate)) {
 		JLOG_ERROR("Failed to create reflexive candidate");
 		return -1;
 	}
@@ -2029,6 +2204,7 @@ int agent_add_candidate_pair(juice_agent_t *agent, ice_candidate_t *local, // lo
 	agent_stun_entry_t *entry = agent->entries + agent->entries_count;
 	entry->type = AGENT_STUN_ENTRY_TYPE_CHECK;
 	entry->state = AGENT_STUN_ENTRY_STATE_IDLE;
+	entry->mode = AGENT_MODE_UNKNOWN;
 	entry->pair = pos;
 	entry->record = pos->remote->resolved;
 	entry->relay_entry = relay_entry;
@@ -2099,11 +2275,7 @@ int agent_unfreeze_candidate_pair(juice_agent_t *agent, ice_candidate_pair_t *pa
 }
 
 void agent_arm_transmission(juice_agent_t *agent, agent_stun_entry_t *entry, timediff_t delay) {
-#ifdef NO_ATOMICS
-	entry->armed = true;
-#else
-	atomic_flag_test_and_set(&entry->armed);
-#endif
+	atomic_store(&entry->armed, true);
 
 	if (entry->state != AGENT_STUN_ENTRY_STATE_SUCCEEDED_KEEPALIVE)
 		entry->state = AGENT_STUN_ENTRY_STATE_PENDING;
@@ -2159,10 +2331,7 @@ void agent_update_candidate_pairs(juice_agent_t *agent) {
 	bool is_controlling = agent->mode == AGENT_MODE_CONTROLLING;
 	for (int i = 0; i < agent->candidate_pairs_count; ++i) {
 		ice_candidate_pair_t *pair = agent->candidate_pairs + i;
-		ice_candidate_t *local = pair->local;
-		pair->local = NULL; // don't take local candidate into account
 		ice_update_candidate_pair(pair, is_controlling);
-		pair->local = local;
 	}
 	agent_update_ordered_pairs(agent);
 }
@@ -2176,77 +2345,83 @@ void agent_update_ordered_pairs(juice_agent_t *agent) {
 		uint64_t priority = agent->candidate_pairs[i].priority;
 		while (--prev >= begin && (*prev)->priority < priority)
 			*(prev + 1) = *prev;
+
 		*(prev + 1) = agent->candidate_pairs + i;
 	}
 }
 
+static inline bool pair_is_relayed(const ice_candidate_pair_t *pair) {
+	return pair->local && pair->local->type == ICE_CANDIDATE_TYPE_RELAYED;
+}
+
+static inline bool entry_is_relayed(const agent_stun_entry_t *entry) {
+	return entry->pair && pair_is_relayed(entry->pair);
+}
+
 agent_stun_entry_t *agent_find_entry_from_record(juice_agent_t *agent, const addr_record_t *record,
                                                  const addr_record_t *relayed) {
-#ifdef NO_ATOMICS
-	agent_stun_entry_t *selected_entry = agent->selected_entry;
-#else
 	agent_stun_entry_t *selected_entry = atomic_load(&agent->selected_entry);
-#endif
 
 	if (agent->state == JUICE_STATE_COMPLETED && selected_entry) {
 		// As an optimization, try to match the selected entry first
 		if (relayed) {
-			if (selected_entry->pair && selected_entry->pair->local &&
-			    selected_entry->pair->local->type == ICE_CANDIDATE_TYPE_RELAYED &&
+			if (entry_is_relayed(selected_entry) &&
 			    addr_record_is_equal(&selected_entry->pair->local->resolved, relayed, true) &&
 			    addr_record_is_equal(&selected_entry->record, record, true)) {
+				JLOG_DEBUG("STUN selected entry matching incoming relayed address");
 				return selected_entry;
 			}
-		} else if (addr_record_is_equal(&selected_entry->record, record, true)) {
-			JLOG_DEBUG("STUN selected entry matching incoming address");
-			return selected_entry;
+		} else {
+			if (!entry_is_relayed(selected_entry) &&
+			    addr_record_is_equal(&selected_entry->record, record, true)) {
+				JLOG_DEBUG("STUN selected entry matching incoming address");
+				return selected_entry;
+			}
 		}
 	}
 
 	if (relayed) {
 		for (int i = 0; i < agent->entries_count; ++i) {
 			agent_stun_entry_t *entry = agent->entries + i;
-			if (entry->pair && entry->pair->local &&
-			    entry->pair->local->type == ICE_CANDIDATE_TYPE_RELAYED &&
+			if (entry_is_relayed(entry) &&
 			    addr_record_is_equal(&entry->pair->local->resolved, relayed, true) &&
 			    addr_record_is_equal(&entry->record, record, true)) {
+				JLOG_DEBUG("STUN entry %d matching incoming relayed address", i);
 				return entry;
 			}
 		}
-
-		return NULL;
-	}
-
-	// Try to match pairs by priority first
-	ice_candidate_pair_t *matching_pair = NULL;
-	for (int i = 0; i < agent->candidate_pairs_count; ++i) {
-		ice_candidate_pair_t *pair = agent->ordered_pairs[i];
-		if (addr_record_is_equal(&pair->remote->resolved, record, true)) {
-			matching_pair = pair;
-			break;
+	} else {
+		// Try to match pairs by priority first
+		ice_candidate_pair_t *matching_pair = NULL;
+		for (int i = 0; i < agent->candidate_pairs_count; ++i) {
+			ice_candidate_pair_t *pair = agent->ordered_pairs[i];
+			if (!pair_is_relayed(pair) &&
+			    addr_record_is_equal(&pair->remote->resolved, record, true)) {
+				matching_pair = pair;
+				break;
+			}
 		}
-	}
 
-	if (matching_pair) {
-		// Just find the corresponding entry
+		if (matching_pair) {
+			// Just find the corresponding entry
+			for (int i = 0; i < agent->entries_count; ++i) {
+				agent_stun_entry_t *entry = agent->entries + i;
+				if (entry->pair == matching_pair) {
+					JLOG_DEBUG("STUN entry %d pair matching incoming address", i);
+					return entry;
+				}
+			}
+		}
+
+		// Try to match entries directly
 		for (int i = 0; i < agent->entries_count; ++i) {
 			agent_stun_entry_t *entry = agent->entries + i;
-			if (entry->pair == matching_pair) {
+			if (!entry_is_relayed(entry) && addr_record_is_equal(&entry->record, record, true)) {
 				JLOG_DEBUG("STUN entry %d matching incoming address", i);
 				return entry;
 			}
 		}
 	}
-
-	// Try to match entries directly
-	for (int i = 0; i < agent->entries_count; ++i) {
-		agent_stun_entry_t *entry = agent->entries + i;
-		if (addr_record_is_equal(&entry->record, record, true)) {
-			JLOG_DEBUG("STUN entry %d matching incoming address", i);
-			return entry;
-		}
-	}
-
 	return NULL;
 }
 

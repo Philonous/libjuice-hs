@@ -66,18 +66,6 @@ static char *alloc_string_copy(const char *orig) {
 	return copy;
 }
 
-static void *alloc_copy(const void *orig, size_t size) {
-	if (!orig || !size)
-		return NULL;
-
-	char *copy = malloc(size);
-	if (!copy)
-		return NULL;
-
-	memcpy(copy, orig, size);
-	return copy;
-}
-
 static server_turn_alloc_t *find_allocation(server_turn_alloc_t allocs[], int size,
                                             const addr_record_t *record, bool allow_deleted) {
 	unsigned long key = addr_record_hash(record, true) % size;
@@ -170,58 +158,49 @@ juice_server_t *server_create(const juice_server_config_t *config) {
 		goto error;
 	}
 
+	if (server->config.max_allocations == 0)
+		server->config.max_allocations = SERVER_DEFAULT_MAX_ALLOCATIONS;
+
+	server->credentials = NULL;
+
 	if (server->config.credentials_count == 0) {
 		// TURN disabled
 		JLOG_INFO("TURN relaying disabled, STUN-only mode");
-		server->config.max_allocations = 0;
-		server->allocs_count = 0;
 		server->allocs = NULL;
+		server->allocs_count = 0;
 
 	} else {
 		// TURN enabled
-		if (server->config.max_allocations == 0)
-			server->config.max_allocations = SERVER_DEFAULT_MAX_ALLOCATIONS;
-
-		server->config.credentials =
-		    alloc_copy(server->config.credentials,
-		               server->config.credentials_count * sizeof(stun_credentials_t));
-		server->credentials_userhash = calloc(server->config.credentials_count, sizeof(uint8_t *));
-		if (!server->config.credentials || !server->credentials_userhash) {
-			JLOG_FATAL("Memory allocation for TURN credentials array failed");
-			goto error;
-		}
-
 		for (int i = 0; i < server->config.credentials_count; ++i) {
 			juice_server_credentials_t *credentials = server->config.credentials + i;
-			credentials->username =
-			    alloc_string_copy(credentials->username ? credentials->username : "");
-			credentials->password =
-			    alloc_string_copy(credentials->password ? credentials->password : "");
-			server->credentials_userhash[i] = malloc(HASH_SHA256_SIZE);
-			if (!credentials->username || !credentials->password ||
-			    !server->credentials_userhash[i]) {
-				JLOG_FATAL("Memory allocation for TURN credentials failed");
-				goto error;
-			}
-
-			stun_compute_userhash(credentials->username, realm, server->credentials_userhash[i]);
 
 			if (server->config.max_allocations < credentials->allocations_quota)
 				server->config.max_allocations = credentials->allocations_quota;
+
+			if (server_do_add_credentials(server, credentials, 0) == NULL) { // never expires
+				JLOG_FATAL("Failed to add TURN credentials");
+				goto error;
+			}
 		}
 
-		for (int i = 0; i < server->config.credentials_count; ++i) {
-			juice_server_credentials_t *credentials = server->config.credentials + i;
+		server->config.credentials = NULL; // Don't copy
+		server->config.credentials_count = 0;
+
+		juice_credentials_list_t *node = server->credentials;
+		while (node) {
+			juice_server_credentials_t *credentials = &node->credentials;
 			if (credentials->allocations_quota == 0) // unlimited
 				credentials->allocations_quota = server->config.max_allocations;
+
+			node = node->next;
 		}
 
-		server->allocs_count = (int)server->config.max_allocations;
-		server->allocs = calloc(server->allocs_count, sizeof(server_turn_alloc_t));
+		server->allocs = calloc(server->config.max_allocations, sizeof(server_turn_alloc_t));
 		if (!server->allocs) {
 			JLOG_FATAL("Memory allocation for TURN allocation table failed");
 			goto error;
 		}
+		server->allocs_count = (int)server->config.max_allocations;
 	}
 
 	server->config.port = udp_get_port(server->sock);
@@ -253,15 +232,24 @@ void server_do_destroy(juice_server_t *server) {
 	closesocket(server->sock);
 	mutex_destroy(&server->mutex);
 
-	for (int i = 0; i < server->config.credentials_count; ++i) {
-		juice_server_credentials_t *credentials = server->config.credentials + i;
-		free((void *)credentials->username);
-		free((void *)credentials->password);
-		free(server->credentials_userhash[i]);
+	server_turn_alloc_t *end = server->allocs + server->allocs_count;
+	for (server_turn_alloc_t *alloc = server->allocs; alloc < end; ++alloc) {
+		delete_allocation(alloc);
 	}
+	free((void *)server->allocs);
+
+	juice_credentials_list_t *node = server->credentials;
+	while (node) {
+		juice_credentials_list_t *prev = node;
+		node = node->next;
+		free((void *)prev->credentials.username);
+		free((void *)prev->credentials.password);
+		free(prev);
+	}
+
+	free((void *)server->config.bind_address);
+	free((void *)server->config.external_address);
 	free((void *)server->config.realm);
-	free(server->config.credentials);
-	free(server->credentials_userhash);
 	free(server);
 
 #ifdef _WIN32
@@ -284,10 +272,94 @@ void server_destroy(juice_server_t *server) {
 
 uint16_t server_get_port(juice_server_t *server) {
 	mutex_lock(&server->mutex);
-	return server->config.port; // updated at creation
+	uint16_t port = server->config.port; // updated at creation
+	mutex_unlock(&server->mutex);
+	return port;
+}
+
+int server_add_credentials(juice_server_t *server, const juice_server_credentials_t *credentials,
+                           timediff_t lifetime) {
+	mutex_lock(&server->mutex);
+
+	if (server->config.max_allocations < credentials->allocations_quota)
+		server->config.max_allocations = credentials->allocations_quota;
+
+	if (server->allocs_count < (int)server->config.max_allocations) {
+		if (server->allocs_count == 0)
+			JLOG_INFO("Enabling TURN relaying");
+
+		server_turn_alloc_t *reallocated =
+		    realloc(server->allocs, server->config.max_allocations * sizeof(server_turn_alloc_t));
+		if (!reallocated) {
+			JLOG_ERROR("Memory allocation for TURN allocation table failed");
+			mutex_unlock(&server->mutex);
+			return -1;
+		}
+		server->allocs_count = (int)server->config.max_allocations;
+		server->allocs = reallocated;
+	}
+
+	juice_credentials_list_t *node = server_do_add_credentials(server, credentials, lifetime);
+	if (!node) {
+		mutex_unlock(&server->mutex);
+		return -1;
+	}
+
+	if (node->credentials.allocations_quota == 0) // unlimited
+		node->credentials.allocations_quota = server->config.max_allocations;
+
+	mutex_unlock(&server->mutex);
+	return 0;
+}
+
+juice_credentials_list_t *server_do_add_credentials(juice_server_t *server,
+                                                    const juice_server_credentials_t *credentials,
+                                                    timediff_t lifetime) {
+	juice_credentials_list_t *node = calloc(1, sizeof(juice_credentials_list_t));
+	if (!node) {
+		JLOG_ERROR("Memory allocation for TURN credentials failed");
+		goto error;
+	}
+
+	node->credentials = *credentials;
+	node->credentials.username =
+	    alloc_string_copy(node->credentials.username ? node->credentials.username : "");
+	node->credentials.password =
+	    alloc_string_copy(node->credentials.password ? node->credentials.password : "");
+
+	if (!node->credentials.username || !node->credentials.password) {
+		JLOG_ERROR("Memory allocation for TURN credentials failed");
+		goto error;
+	}
+
+	stun_compute_userhash(node->credentials.username, server->config.realm, node->userhash);
+
+	if (lifetime > 0)
+		node->timestamp = current_timestamp() + lifetime;
+	else
+		node->timestamp = 0; // never expires
+
+	node->next = server->credentials;
+	server->credentials = node;
+	return server->credentials;
+
+error:
+	if (node) {
+		free((void *)node->credentials.username);
+		free((void *)node->credentials.password);
+		free(node);
+	}
+	return NULL;
 }
 
 void server_run(juice_server_t *server) {
+	const nfds_t nfd = 1 + server->allocs_count;
+	struct pollfd *pfd = calloc(nfd, sizeof(struct pollfd));
+	if (!pfd) {
+		JLOG_FATAL("alloc for poll descriptors failed");
+		return;
+	}
+
 	mutex_lock(&server->mutex);
 
 	// Main loop
@@ -297,72 +369,65 @@ void server_run(juice_server_t *server) {
 		if (timediff < 0)
 			timediff = 0;
 
-		JLOG_VERBOSE("Setting select timeout to %ld ms", (long)timediff);
-		struct timeval timeout;
-		timeout.tv_sec = (long)(timediff / 1000);
-		timeout.tv_usec = (long)((timediff % 1000) * 1000);
+		pfd[0].fd = server->sock;
+		pfd[0].events = POLLIN;
 
-		fd_set readfds;
-		FD_ZERO(&readfds);
-		FD_SET(server->sock, &readfds);
-		int max = SOCKET_TO_INT(server->sock);
-
-		int count = 1;
 		for (int i = 0; i < server->allocs_count; ++i) {
 			server_turn_alloc_t *alloc = server->allocs + i;
 			if (alloc->state == SERVER_TURN_ALLOC_FULL) {
-				++count;
-				FD_SET(alloc->sock, &readfds);
-				if (max < SOCKET_TO_INT(alloc->sock))
-					max = SOCKET_TO_INT(alloc->sock);
+				pfd[1 + i].fd = alloc->sock;
+				pfd[1 + i].events = POLLIN;
+			} else {
+				pfd[1 + i].fd = -1; // ignore
 			}
 		}
 
-		JLOG_VERBOSE("Entering select on %d socket(s)", count);
+		JLOG_VERBOSE("Entering poll for %d ms", (int)timediff);
 		mutex_unlock(&server->mutex);
-		int ret = select(max + 1, &readfds, NULL, NULL, &timeout);
+		int ret = poll(pfd, nfd, (int)timediff);
 		mutex_lock(&server->mutex);
-		JLOG_VERBOSE("Leaving select");
+		JLOG_VERBOSE("Leaving poll");
 		if (ret < 0) {
 			if (sockerrno == SEINTR || sockerrno == SEAGAIN) {
-				JLOG_VERBOSE("select interrupted");
+				JLOG_VERBOSE("poll interrupted");
 				continue;
 			} else {
-				JLOG_FATAL("select failed, errno=%d", sockerrno);
+				JLOG_FATAL("poll failed, errno=%d", sockerrno);
 				break;
 			}
 		}
 
 		if (server->thread_stopped) {
-			JLOG_VERBOSE("Agent destruction requested");
+			JLOG_VERBOSE("Server destruction requested");
 			break;
+		}
+
+		if (pfd[0].revents & POLLNVAL || pfd[0].revents & POLLERR) {
+			JLOG_FATAL("Error when polling server socket");
+			break;
+		}
+
+		if (pfd[0].revents & POLLIN) {
+			if (server_recv(server) < 0)
+				break;
 		}
 
 		for (int i = 0; i < server->allocs_count; ++i) {
 			server_turn_alloc_t *alloc = server->allocs + i;
-			if (alloc->state == SERVER_TURN_ALLOC_FULL && FD_ISSET(alloc->sock, &readfds))
+			if (alloc->state == SERVER_TURN_ALLOC_FULL && pfd[1 + i].revents & POLLIN)
 				server_forward(server, alloc);
 		}
-
-		if (FD_ISSET(server->sock, &readfds)) {
-			if (server_recv(server) < 0)
-				break;
-		}
 	}
+
 	JLOG_DEBUG("Leaving server thread");
 	mutex_unlock(&server->mutex);
+	free(pfd);
 }
 
 int server_send(juice_server_t *server, const addr_record_t *dst, const char *data, size_t size) {
 	JLOG_VERBOSE("Sending datagram, size=%d", size);
 
-#if defined(_WIN32) || defined(__APPLE__)
-	addr_record_t tmp = *dst;
-	addr_map_inet6_v4mapped(&tmp.addr, &tmp.len);
-	int ret = sendto(server->sock, data, (int)size, 0, (const struct sockaddr *)&tmp.addr, tmp.len);
-#else
-	int ret = sendto(server->sock, data, size, 0, (const struct sockaddr *)&dst->addr, dst->len);
-#endif
+	int ret = udp_sendto(server->sock, data, size, dst);
 	if (ret < 0 && sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
 		JLOG_WARN("Send failed, errno=%d", sockerrno);
 
@@ -390,21 +455,8 @@ int server_recv(juice_server_t *server) {
 	while (true) {
 		char buffer[BUFFER_SIZE];
 		addr_record_t record;
-		record.len = sizeof(record.addr);
-		int len = recvfrom(server->sock, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&record.addr,
-		                   &record.len);
+		int len = udp_recvfrom(server->sock, buffer, BUFFER_SIZE, &record);
 		if (len < 0) {
-			if (sockerrno == SECONNRESET || sockerrno == SENETRESET || sockerrno == SECONNREFUSED) {
-				// On Windows, if a UDP socket receives an ICMP port unreachable response after
-				// sending a datagram, this error is stored, and the next call to recvfrom() returns
-				// WSAECONNRESET (port unreachable) or WSAENETRESET (TTL expired).
-				// Therefore, it may be ignored.
-				JLOG_DEBUG("Ignoring %s returned by recvfrom",
-				           sockerrno == SECONNRESET
-				               ? "ECONNRESET"
-				               : (sockerrno == SENETRESET ? "ENETRESET" : "ECONNREFUSED"));
-				continue;
-			}
 			if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK) {
 				JLOG_VERBOSE("No more datagrams to receive");
 				break;
@@ -429,21 +481,8 @@ int server_forward(juice_server_t *server, server_turn_alloc_t *alloc) {
 	while (true) {
 		char buffer[BUFFER_SIZE];
 		addr_record_t record;
-		record.len = sizeof(record.addr);
-		int len = recvfrom(alloc->sock, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&record.addr,
-		                   &record.len);
+		int len = udp_recvfrom(alloc->sock, buffer, BUFFER_SIZE, &record);
 		if (len < 0) {
-			if (sockerrno == SECONNRESET || sockerrno == SENETRESET || sockerrno == SECONNREFUSED) {
-				// On Windows, if a UDP socket receives an ICMP port unreachable response after
-				// sending a datagram, this error is stored, and the next call to recvfrom() returns
-				// WSAECONNRESET (port unreachable) or WSAENETRESET (TTL expired).
-				// Therefore, it may be ignored.
-				JLOG_DEBUG("Ignoring %s returned by recvfrom",
-				           sockerrno == SECONNRESET
-				               ? "ECONNRESET"
-				               : (sockerrno == SENETRESET ? "ENETRESET" : "ECONNREFUSED"));
-				continue;
-			}
 			if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK) {
 				break;
 			}
@@ -463,15 +502,7 @@ int server_forward(juice_server_t *server, server_turn_alloc_t *alloc) {
 
 			JLOG_VERBOSE("Forwarding as ChannelData, size=%d", len);
 
-#if defined(_WIN32) || defined(__APPLE__)
-			addr_record_t tmp = alloc->record;
-			addr_map_inet6_v4mapped(&tmp.addr, &tmp.len);
-			int ret =
-			    sendto(server->sock, buffer, len, 0, (const struct sockaddr *)&tmp.addr, tmp.len);
-#else
-			int ret = sendto(server->sock, buffer, (size_t)len, 0,
-			                 (const struct sockaddr *)&alloc->record.addr, alloc->record.len);
-#endif
+			int ret = udp_sendto(server->sock, buffer, len, &alloc->record);
 			if (ret < 0 && sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
 				JLOG_WARN("Send failed, errno=%d", sockerrno);
 
@@ -501,7 +532,11 @@ int server_input(juice_server_t *server, char *buf, size_t len, const addr_recor
 	JLOG_VERBOSE("Received datagram, size=%d", len);
 
 	if (is_stun_datagram(buf, len)) {
-		JLOG_DEBUG("Received STUN datagram");
+		if (JLOG_DEBUG_ENABLED) {
+			char src_str[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(src, src_str, ADDR_MAX_STRING_LEN);
+			JLOG_DEBUG("Received STUN datagram from %s", src_str);
+		}
 		stun_message_t msg;
 		if (stun_read(buf, len, &msg) < 0) {
 			JLOG_ERROR("STUN message reading failed");
@@ -511,11 +546,19 @@ int server_input(juice_server_t *server, char *buf, size_t len, const addr_recor
 	}
 
 	if (is_channel_data(buf, len)) {
-		JLOG_DEBUG("Received ChannelData datagram");
+		if (JLOG_DEBUG_ENABLED) {
+			char src_str[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(src, src_str, ADDR_MAX_STRING_LEN);
+			JLOG_DEBUG("Received ChannelData datagram from %s", src_str);
+		}
 		return server_process_channel_data(server, buf, len, src);
 	}
 
-	JLOG_WARN("Received unexpected non-STUN datagram, ignoring");
+	if (JLOG_WARN_ENABLED) {
+		char src_str[ADDR_MAX_STRING_LEN];
+		addr_record_to_string(src, src_str, ADDR_MAX_STRING_LEN);
+		JLOG_WARN("Received unexpected non-STUN datagram from %s, ignoring", src_str);
+	}
 	return -1;
 }
 
@@ -527,16 +570,12 @@ int server_interrupt(juice_server_t *server) {
 		return -1;
 	}
 
-	addr_record_t local;
-	if (udp_get_local_addr(server->sock, AF_INET, &local) < 0) {
-		mutex_unlock(&server->mutex);
-		return -1;
-	}
-
-	if (server_send(server, &local, NULL, 0) < 0) {
-		JLOG_WARN("Failed to interrupt thread by triggering socket, errno=%d", sockerrno);
-		mutex_unlock(&server->mutex);
-		return -1;
+	if (udp_sendto_self(server->sock, NULL, 0) < 0) {
+		if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK) {
+			JLOG_WARN("Failed to interrupt thread by triggering socket, errno=%d", sockerrno);
+			mutex_unlock(&server->mutex);
+			return -1;
+		}
 	}
 
 	mutex_unlock(&server->mutex);
@@ -547,19 +586,38 @@ int server_bookkeeping(juice_server_t *server, timestamp_t *next_timestamp) {
 	timestamp_t now = current_timestamp();
 	*next_timestamp = now + 60000;
 
+	// Handle allocations
 	for (int i = 0; i < server->allocs_count; ++i) {
 		server_turn_alloc_t *alloc = server->allocs + i;
 		if (alloc->state != SERVER_TURN_ALLOC_FULL)
 			continue;
 
-		if (alloc->timestamp > now) {
-			if (alloc->timestamp < *next_timestamp)
-				*next_timestamp = alloc->timestamp;
-		} else {
+		if (alloc->timestamp <= now) {
 			JLOG_DEBUG("Allocation timed out");
 			delete_allocation(alloc);
+			continue;
 		}
+
+		if (alloc->timestamp < *next_timestamp)
+			*next_timestamp = alloc->timestamp;
 	}
+
+	// Handle credentials
+	juice_credentials_list_t **pnode = &server->credentials; // We are deleting some elements
+	while (*pnode) {
+		if ((*pnode)->timestamp && (*pnode)->timestamp <= now) {
+			JLOG_DEBUG("Credentials timed out");
+			juice_credentials_list_t *next = (*pnode)->next;
+			free((void *)(*pnode)->credentials.username);
+			free((void *)(*pnode)->credentials.password);
+			free((*pnode));
+			*pnode = next;
+			continue;
+		}
+
+		pnode = &(*pnode)->next;
+	}
+
 	return 0;
 }
 
@@ -648,12 +706,16 @@ int server_dispatch_stun(juice_server_t *server, void *buf, size_t size, stun_me
 			                                NULL); // No username
 		}
 
+		timestamp_t now = current_timestamp();
 		if (msg->credentials.enable_userhash) {
-			for (int i = 0; i < server->config.credentials_count; ++i) {
-				if (const_time_memcmp(server->credentials_userhash[i], msg->credentials.userhash,
-				                      HASH_SHA256_SIZE) == 0) {
-					credentials = &server->config.credentials[i];
+			juice_credentials_list_t *node = server->credentials;
+			while (node) {
+				if ((!node->timestamp || node->timestamp < now) &&
+				    const_time_memcmp(node->userhash, msg->credentials.userhash, USERHASH_SIZE) ==
+				        0) {
+					credentials = &node->credentials;
 				}
+				node = node->next;
 			}
 
 			if (credentials)
@@ -663,11 +725,13 @@ int server_dispatch_stun(juice_server_t *server, void *buf, size_t size, stun_me
 				JLOG_WARN("No credentials for userhash");
 
 		} else {
-			for (int i = 0; i < server->config.credentials_count; ++i) {
-				if (const_time_strcmp(server->config.credentials[i].username,
-				                      msg->credentials.username) == 0) {
-					credentials = &server->config.credentials[i];
+			juice_credentials_list_t *node = server->credentials;
+			while (node) {
+				if ((!node->timestamp || node->timestamp < now) &&
+				    const_time_strcmp(node->credentials.username, msg->credentials.username) == 0) {
+					credentials = &node->credentials;
 				}
+				node = node->next;
 			}
 
 			if (!credentials)
@@ -692,7 +756,7 @@ int server_dispatch_stun(juice_server_t *server, void *buf, size_t size, stun_me
 
 	switch (msg->msg_method) {
 	case STUN_METHOD_BINDING:
-		return server_answer_stun_binding(server, msg->transaction_id, src);
+		return server_process_stun_binding(server, msg, src);
 
 	case STUN_METHOD_ALLOCATE:
 	case STUN_METHOD_REFRESH:
@@ -755,6 +819,17 @@ int server_answer_stun_error(juice_server_t *server, const uint8_t *transaction_
 		server_prepare_credentials(server, src, credentials, &ans);
 
 	return server_stun_send(server, src, &ans, credentials ? credentials->password : NULL);
+}
+
+int server_process_stun_binding(juice_server_t *server, const stun_message_t *msg,
+                                const addr_record_t *src) {
+	if (JLOG_INFO_ENABLED) {
+		char src_str[ADDR_MAX_STRING_LEN];
+		addr_record_to_string(src, src_str, ADDR_MAX_STRING_LEN);
+		JLOG_INFO("Got STUN binding from client %s", src_str);
+	}
+
+	return server_answer_stun_binding(server, msg->transaction_id, src);
 }
 
 int server_process_turn_allocate(juice_server_t *server, const stun_message_t *msg,
@@ -875,6 +950,14 @@ int server_process_turn_allocate(juice_server_t *server, const stun_message_t *m
 		if (!relayed) {
 			JLOG_ERROR("No advertisable relayed address found");
 			goto error;
+		}
+
+		if (JLOG_INFO_ENABLED) {
+			char src_str[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(src, src_str, ADDR_MAX_STRING_LEN);
+			char relayed_str[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(relayed, relayed_str, ADDR_MAX_STRING_LEN);
+			JLOG_INFO("Allocated TURN relayed address %s for client %s", relayed_str, src_str);
 		}
 	}
 
@@ -1024,15 +1107,7 @@ int server_process_turn_send(juice_server_t *server, const stun_message_t *msg,
 
 	JLOG_VERBOSE("Forwarding datagram to peer, size=%zu", msg->data_size);
 
-#if defined(_WIN32) || defined(__APPLE__)
-	addr_record_t tmp = msg->peer;
-	addr_map_inet6_v4mapped(&tmp.addr, &tmp.len);
-	int ret = sendto(alloc->sock, msg->data, (int)msg->data_size, 0,
-	                 (const struct sockaddr *)&tmp.addr, tmp.len);
-#else
-	int ret = sendto(alloc->sock, msg->data, msg->data_size, 0,
-	                 (const struct sockaddr *)&msg->peer.addr, msg->peer.len);
-#endif
+	int ret = udp_sendto(alloc->sock, msg->data, msg->data_size, &msg->peer);
 	if (ret < 0 && sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
 		JLOG_WARN("Forwarding failed, errno=%d", sockerrno);
 
@@ -1072,13 +1147,7 @@ int server_process_channel_data(juice_server_t *server, char *buf, size_t len,
 
 	JLOG_VERBOSE("Forwarding datagram to peer, size=%zu", len);
 
-#if defined(_WIN32) || defined(__APPLE__)
-	addr_map_inet6_v4mapped(&record.addr, &record.len);
-	int ret =
-	    sendto(alloc->sock, buf, (int)len, 0, (const struct sockaddr *)&record.addr, record.len);
-#else
-	int ret = sendto(alloc->sock, buf, len, 0, (const struct sockaddr *)&record.addr, record.len);
-#endif
+	int ret = udp_sendto(alloc->sock, buf, len, &record);
 	if (ret < 0 && sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
 		JLOG_WARN("Send failed, errno=%d", sockerrno);
 

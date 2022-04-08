@@ -72,7 +72,7 @@ static int parse_sdp_candidate(const char *line, ice_candidate_t *candidate) {
 
 	char transport[32 + 1];
 	char type[32 + 1];
-	if (sscanf(line, "%32s %u %32s %u %256s %32s typ %32s", candidate->foundation,
+	if (sscanf(line, "%32s %d %32s %u %256s %32s typ %32s", candidate->foundation,
 	           &candidate->component, transport, &candidate->priority, candidate->hostname,
 	           candidate->service, type) != 7) {
 		JLOG_WARN("Failed to parse candidate: %s", line);
@@ -102,48 +102,6 @@ static int parse_sdp_candidate(const char *line, ice_candidate_t *candidate) {
 	}
 
 	return 0;
-}
-
-static uint32_t compute_priority(ice_candidate_type_t type, int family, int component) {
-	uint32_t p = 0;
-	switch (type) {
-	case ICE_CANDIDATE_TYPE_HOST:
-		p += ICE_CANDIDATE_PREF_HOST;
-		break;
-	case ICE_CANDIDATE_TYPE_PEER_REFLEXIVE:
-		p += ICE_CANDIDATE_PREF_PEER_REFLEXIVE;
-		break;
-	case ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE:
-		p += ICE_CANDIDATE_PREF_SERVER_REFLEXIVE;
-		break;
-	case ICE_CANDIDATE_TYPE_RELAYED:
-		p += ICE_CANDIDATE_PREF_RELAYED;
-		break;
-	default:
-		break;
-	}
-
-	p <<= 16;
-	// TODO: intermingling between IP families
-	switch (family) {
-	case AF_INET:
-		p += 32767;
-		break;
-	case AF_INET6:
-		p += 65535;
-		break;
-	default:
-		break;
-	}
-
-	p <<= 8;
-	p += 256 - CLAMP(component, 1, 256);
-	return p;
-}
-
-static void compute_candidate_priority(ice_candidate_t *candidate) {
-	candidate->priority =
-	    compute_priority(candidate->type, candidate->resolved.addr.ss_family, candidate->component);
 }
 
 int ice_parse_sdp(const char *sdp, ice_description_t *description) {
@@ -196,7 +154,7 @@ int ice_create_local_description(ice_description_t *description) {
 	return 0;
 }
 
-int ice_create_local_candidate(ice_candidate_type_t type, int component,
+int ice_create_local_candidate(ice_candidate_type_t type, int component, int index,
                                const addr_record_t *record, ice_candidate_t *candidate) {
 	memset(candidate, 0, sizeof(*candidate));
 	candidate->type = type;
@@ -204,11 +162,12 @@ int ice_create_local_candidate(ice_candidate_type_t type, int component,
 	candidate->resolved = *record;
 	strcpy(candidate->foundation, "-");
 
-	compute_candidate_priority(candidate);
+	candidate->priority = ice_compute_priority(candidate->type, candidate->resolved.addr.ss_family,
+	                                           candidate->component, index);
 
 	if (getnameinfo((struct sockaddr *)&record->addr, record->len, candidate->hostname, 256,
 	                candidate->service, 32, NI_NUMERICHOST | NI_NUMERICSERV | NI_DGRAM)) {
-		JLOG_ERROR("getnameinfo failed");
+		JLOG_ERROR("getnameinfo failed, errno=%d", sockerrno);
 		return -1;
 	}
 	return 0;
@@ -295,7 +254,7 @@ int ice_generate_sdp(const ice_description_t *description, char *buffer, size_t 
 	if (!*description->ice_ufrag || !*description->ice_pwd)
 		return -1;
 
-	size_t len = 0;
+	int len = 0;
 	char *begin = buffer;
 	char *end = begin + size;
 
@@ -324,10 +283,13 @@ int ice_generate_sdp(const ice_description_t *description, char *buffer, size_t 
 		}
 		if (ret < 0)
 			return -1;
+
 		len += ret;
-		begin += ret < end - begin - 1 ? ret : end - begin - 1;
+
+		if (begin < end)
+			begin += ret >= end - begin ? end - begin - 1 : ret;
 	}
-	return (int)len;
+	return len;
 }
 
 int ice_generate_candidate_sdp(const ice_candidate_t *candidate, char *buffer, size_t size) {
@@ -360,7 +322,7 @@ int ice_generate_candidate_sdp(const ice_candidate_t *candidate, char *buffer, s
 
 int ice_create_candidate_pair(ice_candidate_t *local, ice_candidate_t *remote, bool is_controlling,
                               ice_candidate_pair_t *pair) { // local or remote might be NULL
-	if(local && remote && local->resolved.addr.ss_family != remote->resolved.addr.ss_family) {
+	if (local && remote && local->resolved.addr.ss_family != remote->resolved.addr.ss_family) {
 		JLOG_ERROR("Mismatching candidates address families");
 		return -1;
 	}
@@ -377,14 +339,16 @@ int ice_update_candidate_pair(ice_candidate_pair_t *pair, bool is_controlling) {
 	// or remote See https://tools.ietf.org/html/rfc8445#section-6.1.2.3
 	if (!pair->local && !pair->remote)
 		return 0;
-	uint64_t local_priority = pair->local ? pair->local->priority
-	                                      : compute_priority(ICE_CANDIDATE_TYPE_HOST,
-	                                                         pair->remote->resolved.addr.ss_family,
-	                                                         pair->remote->component);
-	uint64_t remote_priority = pair->remote ? pair->remote->priority
-	                                        : compute_priority(ICE_CANDIDATE_TYPE_HOST,
-	                                                           pair->local->resolved.addr.ss_family,
-	                                                           pair->local->component);
+	uint64_t local_priority =
+	    pair->local
+	        ? pair->local->priority
+	        : ice_compute_priority(ICE_CANDIDATE_TYPE_HOST, pair->remote->resolved.addr.ss_family,
+	                               pair->remote->component, 0);
+	uint64_t remote_priority =
+	    pair->remote
+	        ? pair->remote->priority
+	        : ice_compute_priority(ICE_CANDIDATE_TYPE_HOST, pair->local->resolved.addr.ss_family,
+	                               pair->local->component, 0);
 	uint64_t g = is_controlling ? local_priority : remote_priority;
 	uint64_t d = is_controlling ? remote_priority : local_priority;
 	uint64_t min = g < d ? g : d;
@@ -401,4 +365,44 @@ int ice_candidates_count(const ice_description_t *description, ice_candidate_typ
 			++count;
 	}
 	return count;
+}
+
+uint32_t ice_compute_priority(ice_candidate_type_t type, int family, int component, int index) {
+	// Compute candidate priority according to RFC 8445
+	// See https://tools.ietf.org/html/rfc8445#section-5.1.2.1
+	uint32_t p = 0;
+
+	switch (type) {
+	case ICE_CANDIDATE_TYPE_HOST:
+		p += ICE_CANDIDATE_PREF_HOST;
+		break;
+	case ICE_CANDIDATE_TYPE_PEER_REFLEXIVE:
+		p += ICE_CANDIDATE_PREF_PEER_REFLEXIVE;
+		break;
+	case ICE_CANDIDATE_TYPE_SERVER_REFLEXIVE:
+		p += ICE_CANDIDATE_PREF_SERVER_REFLEXIVE;
+		break;
+	case ICE_CANDIDATE_TYPE_RELAYED:
+		p += ICE_CANDIDATE_PREF_RELAYED;
+		break;
+	default:
+		break;
+	}
+	p <<= 16;
+
+	switch (family) {
+	case AF_INET:
+		p += 32767;
+		break;
+	case AF_INET6:
+		p += 65535;
+		break;
+	default:
+		break;
+	}
+	p -= CLAMP(index, 0, 32767);
+	p <<= 8;
+
+	p += 256 - CLAMP(component, 1, 256);
+	return p;
 }

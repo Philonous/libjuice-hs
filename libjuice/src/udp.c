@@ -54,6 +54,8 @@ static uint16_t get_next_port_in_range(uint16_t begin, uint16_t end) {
 }
 
 socket_t udp_create_socket(const udp_socket_config_t *config) {
+	socket_t sock = INVALID_SOCKET;
+
 	// Obtain local Address
 	struct addrinfo *ai_list = NULL;
 	struct addrinfo hints;
@@ -77,7 +79,7 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 	}
 
 	// Create socket
-	socket_t sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+	sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
 	if (sock == INVALID_SOCKET) {
 		JLOG_ERROR("UDP socket creation failed, errno=%d", sockerrno);
 		goto error;
@@ -108,10 +110,10 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 #endif
 #endif
 
-	// Set buffer size to 2 MiB for performance
-	const sockopt_t bufferSize = 2 * 1024 * 1024;
-	setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char *)&bufferSize, sizeof(bufferSize));
-	setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&bufferSize, sizeof(bufferSize));
+	// Set buffer size up to 1 MiB for performance
+	const sockopt_t buffer_size = 1 * 1024 * 1024;
+	setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char *)&buffer_size, sizeof(buffer_size));
+	setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&buffer_size, sizeof(buffer_size));
 
 	ctl_t blocking = 1;
 	if (ioctlsocket(sock, FIONBIO, &blocking)) {
@@ -168,7 +170,78 @@ socket_t udp_create_socket(const udp_socket_config_t *config) {
 
 error:
 	freeaddrinfo(ai_list);
+	if (sock != INVALID_SOCKET)
+		closesocket(sock);
+
 	return INVALID_SOCKET;
+}
+
+int udp_recvfrom(socket_t sock, char *buffer, size_t size, addr_record_t *src) {
+	while (true) {
+		src->len = sizeof(src->addr);
+		int len =
+		    recvfrom(sock, buffer, (socklen_t)size, 0, (struct sockaddr *)&src->addr, &src->len);
+		if (len >= 0) {
+			addr_unmap_inet6_v4mapped((struct sockaddr *)&src->addr, &src->len);
+
+		} else if (sockerrno == SECONNRESET || sockerrno == SENETRESET ||
+		           sockerrno == SECONNREFUSED) {
+			// On Windows, if a UDP socket receives an ICMP port unreachable response after
+			// sending a datagram, this error is stored, and the next call to recvfrom() returns
+			// WSAECONNRESET (port unreachable) or WSAENETRESET (TTL expired).
+			// Therefore, it may be ignored.
+			JLOG_DEBUG("Ignoring %s returned by recvfrom",
+			           sockerrno == SECONNRESET
+			               ? "ECONNRESET"
+			               : (sockerrno == SENETRESET ? "ENETRESET" : "ECONNREFUSED"));
+			continue;
+		}
+		return len;
+	}
+}
+
+int udp_sendto(socket_t sock, const char *data, size_t size, const addr_record_t *dst) {
+#ifndef __linux__
+	addr_record_t tmp = *dst;
+	addr_record_t name;
+	name.len = sizeof(name.addr);
+	if (getsockname(sock, (struct sockaddr *)&name.addr, &name.len) == 0) {
+		if (name.addr.ss_family == AF_INET6)
+			addr_map_inet6_v4mapped(&tmp.addr, &tmp.len);
+	} else {
+		JLOG_WARN("getsockname failed, errno=%d", sockerrno);
+	}
+	return sendto(sock, data, (socklen_t)size, 0, (const struct sockaddr *)&tmp.addr, tmp.len);
+#else
+	return sendto(sock, data, size, 0, (const struct sockaddr *)&dst->addr, dst->len);
+#endif
+}
+
+int udp_sendto_self(socket_t sock, const char *data, size_t size) {
+	addr_record_t local;
+	if (udp_get_local_addr(sock, AF_UNSPEC, &local) < 0)
+		return -1;
+
+	int ret;
+#ifndef __linux__
+	// We know local has the same address family as sock here
+	ret = sendto(sock, data, (socklen_t)size, 0, (const struct sockaddr *)&local.addr, local.len);
+#else
+	ret = sendto(sock, data, size, 0, (const struct sockaddr *)&local.addr, local.len);
+#endif
+	if (ret >= 0 || local.addr.ss_family != AF_INET6)
+		return ret;
+
+	// Fallback as IPv6 may be disabled on the loopback interface
+	if (udp_get_local_addr(sock, AF_INET, &local) < 0)
+		return -1;
+
+#ifndef __linux__
+	addr_map_inet6_v4mapped(&local.addr, &local.len);
+	return sendto(sock, data, (socklen_t)size, 0, (const struct sockaddr *)&local.addr, local.len);
+#else
+	return sendto(sock, data, size, 0, (const struct sockaddr *)&local.addr, local.len);
+#endif
 }
 
 int udp_set_diffserv(socket_t sock, int ds) {
@@ -176,6 +249,8 @@ int udp_set_diffserv(socket_t sock, int ds) {
 	// IP_TOS has been intentionally broken on Windows in favor of a convoluted proprietary
 	// mechanism called qWave. Thank you Microsoft!
 	// TODO: Investigate if DSCP can be still set directly without administrator flow configuration.
+	(void)sock;
+	(void)ds;
 	JLOG_INFO("IP Differentiated Services are not supported on Windows");
 	return -1;
 #else
@@ -233,10 +308,22 @@ int udp_get_bound_addr(socket_t sock, addr_record_t *record) {
 	return 0;
 }
 
-int udp_get_local_addr(socket_t sock, int family, addr_record_t *record) {
-	switch (family) {
-	case AF_INET: {
-		uint16_t port = udp_get_port(sock);
+int udp_get_local_addr(socket_t sock, int family_hint, addr_record_t *record) {
+	if (udp_get_bound_addr(sock, record) < 0)
+		return -1;
+
+	// If the socket is bound to a particular address, return it
+	if (!addr_is_any((struct sockaddr *)&record->addr)) {
+		if (record->addr.ss_family == AF_INET && family_hint == AF_INET6)
+			addr_map_inet6_v4mapped(&record->addr, &record->len);
+
+		return 0;
+	}
+
+	if (record->addr.ss_family == AF_INET6 && family_hint == AF_INET) {
+		// Generate an IPv4 instead (socket is listening to any IPv4 or IPv6)
+
+		uint16_t port = addr_get_port((struct sockaddr *)&record->addr);
 		if (port == 0)
 			return -1;
 
@@ -245,24 +332,6 @@ int udp_get_local_addr(socket_t sock, int family, addr_record_t *record) {
 		sin->sin_family = AF_INET;
 		sin->sin_port = htons(port);
 		record->len = sizeof(*sin);
-		break;
-	}
-	case AF_INET6: {
-		uint16_t port = udp_get_port(sock);
-		if (port == 0)
-			return -1;
-
-		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&record->addr;
-		memset(sin6, 0, sizeof(*sin6));
-		sin6->sin6_family = AF_INET6;
-		sin6->sin6_port = htons(port);
-		record->len = sizeof(*sin6);
-		break;
-	}
-	default: { // AF_UNSPEC falls here
-		if (udp_get_bound_addr(sock, record) < 0)
-			return -1;
-	}
 	}
 
 	switch (record->addr.ss_family) {
@@ -283,6 +352,10 @@ int udp_get_local_addr(socket_t sock, int family, addr_record_t *record) {
 		// Ignore
 		break;
 	}
+
+	if (record->addr.ss_family == AF_INET && family_hint == AF_INET6)
+		addr_map_inet6_v4mapped(&record->addr, &record->len);
+
 	return 0;
 }
 
@@ -315,6 +388,43 @@ static int has_duplicate_addr(struct sockaddr *addr, const addr_record_t *record
 	return false;
 }
 
+#if !defined(_WIN32) && defined(NO_IFADDRS)
+// Helper function to get the IPv6 address of the default interface
+static int get_local_default_inet6(uint16_t port, struct sockaddr_in6 *result) {
+	const char *dummy_host = "2001:db8::1"; // dummy public unreachable address
+	const uint16_t dummy_port = 9;          // discard port
+
+	struct sockaddr_in6 sin6;
+	memset(&sin6, 0, sizeof(sin6));
+	sin6.sin6_family = AF_INET6;
+	sin6.sin6_port = htons(dummy_port);
+	if (inet_pton(AF_INET6, dummy_host, &sin6.sin6_addr) != 1)
+		return -1;
+
+	socket_t sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+	if (sock == INVALID_SOCKET)
+		return -1;
+
+	if (connect(sock, (const struct sockaddr *)&sin6, sizeof(sin6)))
+		goto error;
+
+	socklen_t result_len = sizeof(*result);
+	if (getsockname(sock, (struct sockaddr *)result, &result_len))
+		goto error;
+
+	if (result_len != sizeof(*result))
+		goto error;
+
+	addr_set_port((struct sockaddr *)result, port);
+	closesocket(sock);
+	return 0;
+
+error:
+	closesocket(sock);
+	return -1;
+}
+#endif
+
 int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 	addr_record_t bound;
 	if (udp_get_bound_addr(sock, &bound) < 0) {
@@ -344,8 +454,9 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 	// specification [RFC6724] specifies that temporary addresses [RFC4941] are to be preferred
 	// over permanent addresses.
 
-	// Here, we will prevent gathering permanent IPv6 addresses if a temporary one is found.
-	// This is more restrictive but fully compliant.
+	// IPv6 IIDs generated by modern systems are opaque so there is no way to reliably differentiate
+	// privacy-enabled IPv6 addresses here. Therefore, we hope the preferred addresses are listed
+	// first, and we never list link-local addresses.
 
 	addr_record_t *current = records;
 	addr_record_t *end = records + count;
@@ -379,21 +490,12 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 	}
 
 	SOCKET_ADDRESS_LIST *list = (SOCKET_ADDRESS_LIST *)buf;
-
-	bool has_temp_inet6 = false;
-	for (int i = 0; i < list->iAddressCount; ++i) {
-		struct sockaddr *sa = list->Address[i].lpSockaddr;
-		if (addr_is_temp_inet6(sa)) {
-			has_temp_inet6 = true;
-			break;
-		}
-	}
-
 	for (int i = 0; i < list->iAddressCount; ++i) {
 		struct sockaddr *sa = list->Address[i].lpSockaddr;
 		socklen_t len = list->Address[i].iSockaddrLength;
-		if ((sa->sa_family == AF_INET || sa->sa_family == AF_INET6) && !addr_is_local(sa) &&
-		    !(has_temp_inet6 && sa->sa_family == AF_INET6 && !addr_is_temp_inet6(sa))) {
+		if ((sa->sa_family == AF_INET ||
+		     (sa->sa_family == AF_INET6 && bound.addr.ss_family == AF_INET6)) &&
+		    !addr_is_local(sa)) {
 			if (!has_duplicate_addr(sa, records, current - records)) {
 				++ret;
 				if (current != end) {
@@ -414,20 +516,6 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 		return -1;
 	}
 
-	bool has_temp_inet6 = false;
-	for (struct ifaddrs *ifa = ifas; ifa; ifa = ifa->ifa_next) {
-		unsigned int flags = ifa->ifa_flags;
-		if (!(flags & IFF_UP) || (flags & IFF_LOOPBACK))
-			continue;
-		if (strcmp(ifa->ifa_name, "docker0") == 0)
-			continue;
-
-		if (ifa->ifa_addr && addr_is_temp_inet6(ifa->ifa_addr)) {
-			has_temp_inet6 = true;
-			break;
-		}
-	}
-
 	for (struct ifaddrs *ifa = ifas; ifa; ifa = ifa->ifa_next) {
 		unsigned int flags = ifa->ifa_flags;
 		if (!(flags & IFF_UP) || (flags & IFF_LOOPBACK))
@@ -437,9 +525,10 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 
 		struct sockaddr *sa = ifa->ifa_addr;
 		socklen_t len;
-		if (sa && (sa->sa_family == AF_INET || sa->sa_family == AF_INET6) && !addr_is_local(sa) &&
-		    !(has_temp_inet6 && sa->sa_family == AF_INET6 && !addr_is_temp_inet6(sa)) &&
-		    (len = addr_get_len(sa)) > 0) {
+		if (sa &&
+		    (sa->sa_family == AF_INET ||
+		     (sa->sa_family == AF_INET6 && bound.addr.ss_family == AF_INET6)) &&
+		    !addr_is_local(sa) && (len = addr_get_len(sa)) > 0) {
 			if (!has_duplicate_addr(sa, records, current - records)) {
 				++ret;
 				if (current != end) {
@@ -466,17 +555,23 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 		return -1;
 	}
 
+	bool ifconf_has_inet6 = false;
 	int n = ifc.ifc_len / sizeof(struct ifreq);
 	for (int i = 0; i < n; ++i) {
 		struct ifreq *ifr = ifc.ifc_req + i;
 		struct sockaddr *sa = &ifr->ifr_addr;
-		if (sa->sa_family == AF_INET && !addr_is_local(sa)) {
-			struct sockaddr_in *sin = (struct sockaddr_in *)&ifr->ifr_addr;
+		if (sa->sa_family == AF_INET6)
+			ifconf_has_inet6 = true;
+
+		socklen_t len;
+		if ((sa->sa_family == AF_INET ||
+		     (sa->sa_family == AF_INET6 && bound.addr.ss_family == AF_INET6)) &&
+		    !addr_is_local(sa) && (len = addr_get_len(sa)) > 0) {
 			if (!has_duplicate_addr(sa, records, current - records)) {
 				++ret;
 				if (current != end) {
-					memcpy(&current->addr, sin, sizeof(*sin));
-					current->len = sizeof(*sin);
+					memcpy(&current->addr, sa, len);
+					current->len = len;
 					addr_set_port((struct sockaddr *)&current->addr, port);
 					++current;
 				}
@@ -484,42 +579,18 @@ int udp_get_addrs(socket_t sock, addr_record_t *records, size_t count) {
 		}
 	}
 
-	char hostname[HOST_NAME_MAX];
-	if (gethostname(hostname, HOST_NAME_MAX))
-		strcpy(hostname, "localhost");
-
-	char service[8];
-	snprintf(service, 8, "%hu", port);
-
-	struct addrinfo *ai_list = NULL;
-	struct addrinfo hints;
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_INET6;
-	hints.ai_socktype = SOCK_DGRAM;
-	hints.ai_protocol = 0;
-	hints.ai_flags = AI_ADDRCONFIG | AI_NUMERICSERV;
-	if (getaddrinfo(hostname, service, &hints, &ai_list) == 0) {
-		bool has_temp_inet6 = false;
-		for (struct addrinfo *ai = ai_list; ai; ai = ai->ai_next) {
-			if (addr_is_temp_inet6(ai->ai_addr)) {
-				has_temp_inet6 = true;
-				break;
-			}
-		}
-		for (struct addrinfo *ai = ai_list; ai; ai = ai->ai_next) {
-			if (!addr_is_local(ai->ai_addr) &&
-			    !(has_temp_inet6 && !addr_is_temp_inet6(ai->ai_addr))) {
-				if (!has_duplicate_addr(ai->ai_addr, records, current - records)) {
-					++ret;
-					if (current != end) {
-						memcpy(&current->addr, ai->ai_addr, ai->ai_addrlen);
-						current->len = ai->ai_addrlen;
-						++current;
-					}
+	if (!ifconf_has_inet6 && bound.addr.ss_family == AF_INET6) {
+		struct sockaddr_in6 sin6;
+		if (get_local_default_inet6(port, &sin6) == 0) {
+			if (!addr_is_local((const struct sockaddr *)&sin6)) {
+				++ret;
+				if (current != end) {
+					memcpy(&current->addr, &sin6, sizeof(sin6));
+					current->len = sizeof(sin6);
+					++current;
 				}
 			}
 		}
-		freeaddrinfo(ai_list);
 	}
 #endif
 #endif

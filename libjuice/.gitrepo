@@ -5,8 +5,8 @@
 ;
 [subrepo]
 	remote = https://github.com/paullouisageneau/libjuice.git
-	branch = master
-	commit = 75d0f1182382c20cb6fe4fc90c013a41c954dd47
-	parent = e218822e8885a803ec0424d9cf326a432741b556
+	branch = v0.9.8
+	commit = e2bb4df9c9a2d3a296312925f313bf6f26854010
+	parent = c09c15c62b3e7890b22a9052812259ab30981a0a
 	method = merge
 	cmdver = 0.4.1

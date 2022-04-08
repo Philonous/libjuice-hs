@@ -68,6 +68,9 @@ static size_t generate_hmac_key(const stun_message_t *msg, const char *password,
 		if (input_len < 0)
 			return 0;
 
+		if (input_len >= MAX_HMAC_INPUT_LEN)
+			input_len = MAX_HMAC_INPUT_LEN - 1;
+
 		switch (msg->credentials.password_algorithm) {
 		case STUN_PASSWORD_ALGORITHM_SHA256:
 			hash_sha256(input, input_len, key);
@@ -79,7 +82,13 @@ static size_t generate_hmac_key(const stun_message_t *msg, const char *password,
 	} else {
 		// short-term credentials
 		int key_len = snprintf((char *)key, MAX_HMAC_KEY_LEN, "%s", password ? password : "");
-		return key_len < 0 ? 0 : key_len;
+		if (key_len < 0)
+			return 0;
+
+		if (key_len >= MAX_HMAC_KEY_LEN)
+			key_len = MAX_HMAC_KEY_LEN - 1;
+
+		return key_len;
 	}
 }
 
@@ -264,7 +273,7 @@ int stun_write(void *buf, size_t size, const stun_message_t *msg, const char *pa
 	if (msg->msg_class == STUN_CLASS_REQUEST) {
 		if (msg->credentials.enable_userhash) {
 			len = stun_write_attr(pos, end - pos, STUN_ATTR_USERHASH, msg->credentials.userhash,
-			                      HASH_SHA256_SIZE);
+			                      USERHASH_SIZE);
 			if (len <= 0)
 				goto overflow;
 			pos += len;
@@ -277,7 +286,10 @@ int stun_write(void *buf, size_t size, const stun_message_t *msg, const char *pa
 			pos += len;
 		}
 	}
-	if (msg->msg_class == STUN_CLASS_REQUEST || msg->msg_method == STUN_METHOD_ALLOCATE) {
+	if (msg->msg_class == STUN_CLASS_REQUEST ||
+	    (msg->msg_class == STUN_CLASS_RESP_ERROR &&
+	     (msg->error_code == 401 || msg->error_code == 438) // Unauthenticated or Stale Nonce
+	     )) {
 		if (*msg->credentials.realm != '\0') {
 			len = stun_write_attr(pos, end - pos, STUN_ATTR_REALM, msg->credentials.realm,
 			                      strlen(msg->credentials.realm));
@@ -323,23 +335,30 @@ int stun_write(void *buf, size_t size, const stun_message_t *msg, const char *pa
 		}
 	}
 	if (msg->msg_class != STUN_CLASS_INDICATION && password) {
-		// According to RFC 8489, the agent must include both MESSAGE-INTEGRITY and
-		// MESSAGE-INTEGRITY-SHA256. However, this make legacy agents and servers fail with error
-		// 420 Unknown Attribute. Therefore, only MESSAGE-INTEGRITY is included in the message for
-		// compatibility.
-		size_t tmp_length = pos - attr_begin + STUN_ATTR_SIZE + HMAC_SHA1_SIZE;
-		stun_update_header_length(begin, tmp_length);
 		uint8_t key[MAX_HMAC_KEY_LEN];
 		size_t key_len = generate_hmac_key(msg, password, key);
 
+		size_t tmp_length = pos - attr_begin + STUN_ATTR_SIZE + HMAC_SHA1_SIZE;
+		stun_update_header_length(begin, tmp_length);
+
+		uint8_t hmac[HMAC_SHA1_SIZE];
+		hmac_sha1(begin, pos - begin, key, key_len, hmac);
+		len = stun_write_attr(pos, end - pos, STUN_ATTR_MESSAGE_INTEGRITY, hmac, HMAC_SHA1_SIZE);
+		if (len <= 0)
+			goto overflow;
+		pos += len;
+
 		// According to RFC 8489, the agent must include both MESSAGE-INTEGRITY and
-		// MESSAGE-INTEGRITY-SHA256. However, this makes older servers fail with error 420 Unknown
-		// Attribute. Therefore, unless the password algorithm SHA-256 is enabled, only
+		// MESSAGE-INTEGRITY-SHA256. However, this makes legacy agents and servers fail with error
+		// 420 Unknown Attribute. Therefore, unless the password algorithm SHA-256 is enabled, only
 		// MESSAGE-INTEGRITY is included in the message for compatibility.
 		if (msg->credentials.password_algorithm != STUN_PASSWORD_ALGORITHM_UNSET) {
 			// If the response contains a PASSWORD-ALGORITHMS attribute, all the
 			// subsequent requests MUST be authenticated using MESSAGE-INTEGRITY-
 			// SHA256 only.
+			size_t tmp_length = pos - attr_begin + STUN_ATTR_SIZE + HMAC_SHA256_SIZE;
+			stun_update_header_length(begin, tmp_length);
+
 			uint8_t hmac[HMAC_SHA256_SIZE];
 			hmac_sha256(begin, pos - begin, key, key_len, hmac);
 			len = stun_write_attr(pos, end - pos, STUN_ATTR_MESSAGE_INTEGRITY_SHA256, hmac,
@@ -348,13 +367,6 @@ int stun_write(void *buf, size_t size, const stun_message_t *msg, const char *pa
 				goto overflow;
 			pos += len;
 		}
-
-		uint8_t hmac[HMAC_SHA1_SIZE];
-		hmac_sha1(begin, pos - begin, key, key_len, hmac);
-		len = stun_write_attr(pos, end - pos, STUN_ATTR_MESSAGE_INTEGRITY, hmac, HMAC_SHA1_SIZE);
-		if (len <= 0)
-			goto overflow;
-		pos += len;
 	}
 
 	size_t length = pos - attr_begin + STUN_ATTR_SIZE + 4;
@@ -430,7 +442,7 @@ int stun_write_value_mapped_address(void *buf, size_t size, const struct sockadd
 		value->family = STUN_ADDRESS_FAMILY_IPV4;
 		if (size < sizeof(struct stun_value_mapped_address) + 4)
 			return -1;
-		if (addrlen < sizeof(struct sockaddr_in))
+		if (addrlen < (socklen_t)sizeof(struct sockaddr_in))
 			return -1;
 		JLOG_VERBOSE("Writing IPv4 address");
 		const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
@@ -444,7 +456,7 @@ int stun_write_value_mapped_address(void *buf, size_t size, const struct sockadd
 		value->family = STUN_ADDRESS_FAMILY_IPV6;
 		if (size < sizeof(struct stun_value_mapped_address) + 16)
 			return -1;
-		if (addrlen < sizeof(struct sockaddr_in6))
+		if (addrlen < (socklen_t)sizeof(struct sockaddr_in6))
 			return -1;
 		JLOG_VERBOSE("Writing IPv6 address");
 		const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
@@ -584,7 +596,7 @@ int stun_read(void *data, size_t size, stun_message_t *msg) {
 	}
 
 	if (security_bits & STUN_SECURITY_USERNAME_ANONYMITY_BIT) {
-		JLOG_VERBOSE("Remote agent supports user anonymity");
+		JLOG_DEBUG("Remote agent supports user anonymity");
 		credentials->enable_userhash = true;
 	}
 
@@ -617,7 +629,8 @@ int stun_read_attr(const void *data, size_t size, stun_message_t *msg, uint8_t *
 
 	// RFC 8489: Note that agents MUST ignore all attributes that follow MESSAGE-INTEGRITY, with
 	// the exception of the MESSAGE-INTEGRITY-SHA256 and FINGERPRINT attributes.
-	if (msg->has_integrity && type != STUN_ATTR_FINGERPRINT) {
+	if (msg->has_integrity && type != STUN_ATTR_MESSAGE_INTEGRITY &&
+	    type != STUN_ATTR_MESSAGE_INTEGRITY_SHA256 && type != STUN_ATTR_FINGERPRINT) {
 		JLOG_DEBUG("Ignoring STUN attribute 0x%X after message integrity", (unsigned int)type);
 		while (length & 0x03)
 			++length; // attributes are aligned on 4 bytes
@@ -641,6 +654,13 @@ int stun_read_attr(const void *data, size_t size, stun_message_t *msg, uint8_t *
 			return -1;
 		break;
 	}
+	case STUN_ATTR_ALTERNATE_SERVER: {
+		JLOG_VERBOSE("Reading alternate server");
+		uint8_t zero_mask[16] = {0};
+		if (stun_read_value_mapped_address(attr->value, length, &msg->alternate_server, zero_mask) < 0)
+			return -1;
+		break;
+	}
 	case STUN_ATTR_ERROR_CODE: {
 		JLOG_VERBOSE("Reading error code");
 		if (length < sizeof(struct stun_value_error_code)) {
@@ -651,12 +671,20 @@ int stun_read_attr(const void *data, size_t size, stun_message_t *msg, uint8_t *
 		    (const struct stun_value_error_code *)attr->value;
 		msg->error_code = (error->code_class & 0x07) * 100 + error->code_number;
 
-		size_t reason_length = length - sizeof(struct stun_value_error_code);
-		char buffer[STUN_MAX_ERROR_REASON_LEN];
-		memcpy(buffer, (const char *)error->reason, reason_length);
-		buffer[reason_length] = '\0';
+		if (msg->error_code == 401 || msg->error_code == 438) { // Unauthenticated or Stale Nonce
+			JLOG_DEBUG("Got STUN error code %u", msg->error_code);
 
-		JLOG_INFO("Got STUN error code %u, reason \"%s\"", msg->error_code, buffer);
+		} else if (JLOG_INFO_ENABLED) {
+			size_t reason_length = length - sizeof(struct stun_value_error_code);
+			if (reason_length >= STUN_MAX_ERROR_REASON_LEN)
+				reason_length = STUN_MAX_ERROR_REASON_LEN - 1;
+
+			char buffer[STUN_MAX_ERROR_REASON_LEN];
+			memcpy(buffer, (const char *)error->reason, reason_length);
+			buffer[reason_length] = '\0';
+
+			JLOG_INFO("Got STUN error code %u, reason \"%s\"", msg->error_code, buffer);
+		}
 		break;
 	}
 	case STUN_ATTR_UNKNOWN_ATTRIBUTES: {
@@ -762,7 +790,7 @@ int stun_read_attr(const void *data, size_t size, stun_message_t *msg, uint8_t *
 				security_bits = 0;
 			}
 		} else if (msg->msg_class == STUN_CLASS_RESP_ERROR) {
-			JLOG_INFO("Remote agent does not support RFC 8489");
+			JLOG_DEBUG("Remote agent does not support RFC 8489");
 		}
 		break;
 	}
@@ -839,11 +867,11 @@ int stun_read_attr(const void *data, size_t size, stun_message_t *msg, uint8_t *
 	}
 	case STUN_ATTR_USERHASH: {
 		JLOG_VERBOSE("Reading user hash");
-		if (length != HASH_SHA256_SIZE) {
+		if (length != USERHASH_SIZE) {
 			JLOG_WARN("STUN user hash value too long, length=%zu", length);
 			return -1;
 		}
-		memcpy(msg->credentials.userhash, attr->value, HASH_SHA256_SIZE);
+		memcpy(msg->credentials.userhash, attr->value, USERHASH_SIZE);
 		msg->credentials.enable_userhash = true;
 		break;
 	}
@@ -1140,6 +1168,9 @@ void stun_compute_userhash(const char *username, const char *realm, uint8_t *out
 	int input_len = snprintf(input, MAX_USERHASH_INPUT_LEN, "%s:%s", username, realm);
 	if (input_len < 0)
 		return;
+
+	if (input_len >= MAX_USERHASH_INPUT_LEN)
+		input_len = MAX_USERHASH_INPUT_LEN - 1;
 
 	hash_sha256(input, input_len, out);
 }
