@@ -40,7 +40,7 @@ juiceMaxSdpStringLen = {#const JUICE_MAX_SDP_STRING_LEN #}
 -- Config And Agent ------------------------------------------------------------
 --------------------------------------------------------------------------------
 
-{# pointer * juice_agent_t as Agent foreign finalizer juice_destroy as destroyAgent newtype #}
+{# pointer * juice_agent_t as Agent foreign finalizer juice_destroy as destroyAgentFptr newtype #}
 
 foreign import ccall "wrapper"
   mkStateChangedCallback ::
@@ -96,7 +96,7 @@ newAgent Config{..} Callbacks{..} =
     {#set juice_config.cb_recv#} configPtr =<< mkRecv
 
     agentPtr <- {#call juice_create as ^ #} configPtr
-    Agent <$> newForeignPtr destroyAgent agentPtr
+    Agent <$> newForeignPtr destroyAgentFptr agentPtr
   where
     mkStateChanged =
       mkStateChangedCallback $
@@ -118,6 +118,10 @@ newAgent Config{..} Callbacks{..} =
 
 touchAgent :: Agent -> IO ()
 touchAgent (Agent agent) = touchForeignPtr agent
+
+destroyAgent :: Agent -> IO ()
+destroyAgent (Agent agent) = finalizeForeignPtr agent
+
 
 withNewAgent :: Config -> Callbacks -> (Agent -> IO a) -> IO a
 withNewAgent config callbacks f = do
@@ -191,7 +195,6 @@ getSelectedAddresses agent = fmap (\(((), remote), local) -> (local, remote)) $
   textOut 4096 $ \remote ->
     checkError $ {#call juice_get_selected_addresses#} agentPtr
        local 4096 remote 4096
-
 
 textOut bufsize f =
   allocaBytes bufsize $ \ptr -> do

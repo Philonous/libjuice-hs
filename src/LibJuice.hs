@@ -31,6 +31,9 @@ withConnection Connection{connectionAgent} f = f connectionAgent
 connect :: B.Config -> B.Callbacks -> IO Connection
 connect config callbacks = Connection <$> B.newAgent config callbacks
 
+disconnect :: Connection -> IO ()
+disconnect con = withConnection con $ \agent -> B.destroyAgent agent
+
 gatherCandidates :: Connection -> IO ()
 gatherCandidates con = withConnection con B.gatherCandidates
 
