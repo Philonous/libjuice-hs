@@ -5,6 +5,7 @@ module LibJuice
   , B.Config(..)
   , B.Callbacks(..)
   , B.JuiceError(..)
+  , B.State(..)
   )
 where
 
@@ -37,14 +38,14 @@ disconnect con = withConnection con $ \agent -> B.destroyAgent agent
 gatherCandidates :: Connection -> IO ()
 gatherCandidates con = withConnection con B.gatherCandidates
 
-getLocalDescription :: Connection -> IO Text
+getLocalDescription :: Connection -> IO ByteString
 getLocalDescription con = withConnection con B.getLocalDescription
 
-setRemoteDescription :: Connection -> Text -> IO ()
+setRemoteDescription :: Connection -> ByteString -> IO ()
 setRemoteDescription con des =
   withConnection con (\agent -> B.setRemoteDescription agent des)
 
-addRemoteCandidate :: Connection -> Text -> IO ()
+addRemoteCandidate :: Connection -> ByteString -> IO ()
 addRemoteCandidate con cand =
   withConnection con (\agent -> B.addRemoteCandidate agent cand)
 
@@ -63,8 +64,8 @@ sendDiffserv con bs ds =
 getState :: Connection -> IO B.State
 getState con = withConnection con B.getState
 
-getSelectedCanidates :: Connection -> IO (Text, Text)
+getSelectedCanidates :: Connection -> IO (ByteString, ByteString)
 getSelectedCanidates con = withConnection con B.getSelectedCandidates
 
-getSelectedAddresses :: Connection -> IO (Text, Text)
+getSelectedAddresses :: Connection -> IO (ByteString, ByteString)
 getSelectedAddresses con = withConnection con B.getSelectedAddresses

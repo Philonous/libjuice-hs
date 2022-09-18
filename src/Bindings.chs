@@ -141,23 +141,23 @@ gatherCandidates :: Agent -> IO ()
 gatherCandidates agent = withAgent agent $ \agentPtr ->
   checkError $ {#call juice_gather_candidates#} agentPtr
 
-getLocalDescription :: Agent -> IO Text
+getLocalDescription :: Agent -> IO ByteString
 getLocalDescription agent = fmap snd $
   withAgent agent $ \agentPtr ->
   textOut maxCandidateSdpStringLen $ \buffer ->
     checkError $ {#call juice_get_local_description #} agentPtr buffer
     (fromIntegral maxCandidateSdpStringLen)
 
-setRemoteDescription :: Agent -> Text -> IO ()
+setRemoteDescription :: Agent -> ByteString -> IO ()
 setRemoteDescription agent bs =
   withAgent agent $ \agentPtr ->
-  BS.useAsCString (Text.encodeUtf8 bs) $ \ptr ->
+  BS.useAsCString bs $ \ptr ->
   checkError $ {#call juice_set_remote_description#} agentPtr ptr
 
-addRemoteCandidate :: Agent -> Text -> IO ()
+addRemoteCandidate :: Agent -> ByteString -> IO ()
 addRemoteCandidate agent bs =
   withAgent agent $ \agentPtr ->
-  BS.useAsCString (Text.encodeUtf8 bs) $ \ptr ->
+  BS.useAsCString bs $ \ptr ->
   checkError $ {#call juice_add_remote_candidate#} agentPtr ptr
 
 setRemoteGatheringDone :: Agent -> IO ()
@@ -180,7 +180,7 @@ getState :: Agent -> IO State
 getState agent = withAgent agent $ \agentPtr ->
   (toEnum . fromIntegral) <$> {#call juice_get_state#} agentPtr
 
-getSelectedCandidates :: Agent -> IO (Text, Text)
+getSelectedCandidates :: Agent -> IO (ByteString, ByteString)
 getSelectedCandidates agent = fmap (\(((), remote), local) -> (local, remote)) $
   withAgent agent $ \agentPtr ->
   textOut 4096 $ \local ->
@@ -188,7 +188,7 @@ getSelectedCandidates agent = fmap (\(((), remote), local) -> (local, remote)) $
     checkError $ {#call juice_get_selected_candidates#} agentPtr
        local 4096 remote 4096
 
-getSelectedAddresses :: Agent -> IO (Text, Text)
+getSelectedAddresses :: Agent -> IO (ByteString, ByteString)
 getSelectedAddresses agent = fmap (\(((), remote), local) -> (local, remote)) $
   withAgent agent $ \agentPtr ->
   textOut 4096 $ \local ->
@@ -200,4 +200,4 @@ textOut bufsize f =
   allocaBytes bufsize $ \ptr -> do
     res <- f ptr
     bs <- BS.packCString ptr
-    return (res, Text.decodeUtf8 bs)
+    return (res, bs)
