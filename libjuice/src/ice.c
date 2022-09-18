@@ -30,7 +30,7 @@
 
 #define CLAMP(x, low, high) (((x) > (high)) ? (high) : (((x) < (low)) ? (low) : (x)))
 
-// See RFC4566 for SDP format: https://tools.ietf.org/html/rfc4566
+// See RFC4566 for SDP format: https://www.rfc-editor.org/rfc/rfc4566.html
 
 static const char *skip_prefix(const char *str, const char *prefix) {
 	size_t len = strlen(prefix);
@@ -260,7 +260,7 @@ int ice_generate_sdp(const ice_description_t *description, char *buffer, size_t 
 
 	// Round 0: description
 	// Round i with i>0 and i<count+1: candidate i-1
-	// Round count + 1: ice-options:trickle/end-of-candidates line
+	// Round count + 1: end-of-candidates and ice-options lines
 	for (int i = 0; i < description->candidates_count + 2; ++i) {
 		int ret;
 		if (i == 0) {
@@ -276,10 +276,12 @@ int ice_generate_sdp(const ice_description_t *description, char *buffer, size_t 
 				continue;
 			ret = snprintf(begin, end - begin, "%s\r\n", tmp);
 		} else { // i == description->candidates_count + 1
+			// RFC 8445 10. ICE Option: An agent compliant to this specification MUST inform the
+			// peer about the compliance using the 'ice2' option.
 			if (description->finished)
-				ret = snprintf(begin, end - begin, "a=end-of-candidates\r\n");
+				ret = snprintf(begin, end - begin, "a=end-of-candidates\r\na=ice-options:ice2\r\n");
 			else
-				ret = snprintf(begin, end - begin, "a=ice-options:trickle\r\n");
+				ret = snprintf(begin, end - begin, "a=ice-options:ice2,trickle\r\n");
 		}
 		if (ret < 0)
 			return -1;
@@ -336,7 +338,7 @@ int ice_create_candidate_pair(ice_candidate_t *local, ice_candidate_t *remote, b
 
 int ice_update_candidate_pair(ice_candidate_pair_t *pair, bool is_controlling) {
 	// Compute pair priority according to RFC 8445, extended to support generic pairs missing local
-	// or remote See https://tools.ietf.org/html/rfc8445#section-6.1.2.3
+	// or remote See https://www.rfc-editor.org/rfc/rfc8445.html#section-6.1.2.3
 	if (!pair->local && !pair->remote)
 		return 0;
 	uint64_t local_priority =
@@ -369,7 +371,7 @@ int ice_candidates_count(const ice_description_t *description, ice_candidate_typ
 
 uint32_t ice_compute_priority(ice_candidate_type_t type, int family, int component, int index) {
 	// Compute candidate priority according to RFC 8445
-	// See https://tools.ietf.org/html/rfc8445#section-5.1.2.1
+	// See https://www.rfc-editor.org/rfc/rfc8445.html#section-5.1.2.1
 	uint32_t p = 0;
 
 	switch (type) {

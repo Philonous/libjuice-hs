@@ -31,7 +31,7 @@
 #pragma pack(push, 1)
 /*
  * TURN ChannelData Message
- * See https://tools.ietf.org/html/rfc8656#section-12.4
+ * See https://www.rfc-editor.org/rfc/rfc8656.html#section-12.4
  *
  *  0                   1                   2                   3
  *  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
@@ -63,7 +63,7 @@ int turn_wrap_channel_data(char *buffer, size_t size, const char *data, size_t d
 // TURN state map
 
 typedef enum turn_entry_type {
-	TURN_ENTRY_TYPE_EMPTY,
+	TURN_ENTRY_TYPE_EMPTY = 0,
 	TURN_ENTRY_TYPE_DELETED,
 	TURN_ENTRY_TYPE_PERMISSION,
 	TURN_ENTRY_TYPE_CHANNEL

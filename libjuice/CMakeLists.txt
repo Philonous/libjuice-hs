@@ -1,6 +1,6 @@
 cmake_minimum_required (VERSION 3.7)
 project (libjuice
-	VERSION 0.9.8
+	VERSION 1.0.4
 	LANGUAGES C)
 set(PROJECT_DESCRIPTION "UDP Interactive Connectivity Establishment (ICE) library")
 
@@ -9,6 +9,7 @@ option(NO_SERVER "Disable server support" OFF)
 option(NO_TESTS "Disable tests build" OFF)
 option(NO_EXPORT_HEADER "Disable export header" OFF)
 option(WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
+option(FUZZER "Enable oss-fuzz fuzzing" OFF)
 
 # Mitigations
 option(ENABLE_LOCALHOST_ADDRESS "List localhost addresses in candidates" OFF)
@@ -31,6 +32,10 @@ set(LIBJUICE_SOURCES
 	${CMAKE_CURRENT_SOURCE_DIR}/src/agent.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/crc32.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/const_time.c
+	${CMAKE_CURRENT_SOURCE_DIR}/src/conn.c
+	${CMAKE_CURRENT_SOURCE_DIR}/src/conn_poll.c
+	${CMAKE_CURRENT_SOURCE_DIR}/src/conn_thread.c
+	${CMAKE_CURRENT_SOURCE_DIR}/src/conn_mux.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/base64.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/hash.c
 	${CMAKE_CURRENT_SOURCE_DIR}/src/hmac.c
@@ -58,13 +63,20 @@ set(TESTS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/test/stun.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/gathering.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/connectivity.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/test/notrickle.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/turn.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/thread.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/mux.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/notrickle.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/server.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/conflict.c
     ${CMAKE_CURRENT_SOURCE_DIR}/test/bind.c
 )
 source_group("Test Files" FILES "${TESTS_SOURCES}")
+
+set(FUZZER_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/fuzzer/fuzzer.c
+)
+source_group("Fuzzer Files" FILES "${FUZZER_SOURCES}")
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
@@ -204,3 +216,12 @@ if(NOT NO_TESTS)
 	target_link_libraries(juice-tests juice Threads::Threads)
 endif()
 
+# Fuzzer
+if(FUZZER)
+	add_executable(stun-fuzzer ${FUZZER_SOURCES})
+	target_include_directories(stun-fuzzer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+	target_include_directories(stun-fuzzer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/juice)
+
+	set_target_properties(stun-fuzzer PROPERTIES OUTPUT_NAME fuzzer)
+	target_link_libraries(stun-fuzzer juice-static ${LIB_FUZZING_ENGINE})
+endif()
