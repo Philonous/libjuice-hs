@@ -19,3 +19,9 @@ licensed under LGPL v2.1
 ## Requirements:
 * stack
 * make
+
+# How to update the c source code:
+* Requires: git-subrepo
+* run:
+```
+git subrepo fetch libjuice

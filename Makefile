@@ -5,22 +5,18 @@ export stack_args := ${stack_args} --colour=auto
 endif
 
 srcfiles = $(shell find src -type f)
-test-srcfiles = $(shell find test-suite -type f)
+c-files = $(shell find libjuice -type f)
 
 tests = dist/tests/tests
 
 .PHONY: build
 build: dist/libjuice-hs $(tests)
 
-$(tests): dist/tests/% : dist/libjuice-hs $(test-srcfiles) package.yaml stack.yaml
+$(tests): dist/tests/% : dist/libjuice-hs $(test-srcfiles) libjuice-hs.cabal stack.yaml
 	mkdir -p dist/tests
 	cp "$(shell stack ${stack_args} path --dist-dir)/build/$(notdir $@)/$(notdir $@)" dist/tests/
 
-libjuice:
-	git submodule update --init --recursive
-
-dist/libjuice-hs: libjuice $(srcfiles) $(test-srcfiles) package.yaml stack.yaml
-	rm -f *.cabal
+dist/libjuice-hs: $(srcfiles) $(c-files) libjuice-hs.cabal stack.yaml
 	rm -f stack.yaml.lock
 	mkdir -p ./dist
 	stack build --install-ghc \
@@ -39,7 +35,6 @@ clean:
 	stack clean
 	rm -f stack.yaml.lock
 	rm -rf dist
-	rm -f *.cabal
 
 .PHONY: distclean
 distclean: clean
