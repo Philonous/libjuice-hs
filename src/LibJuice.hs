@@ -2,10 +2,13 @@
 {-# LANGUAGE NamedFieldPuns #-}
 module LibJuice
   ( module LibJuice
+  , B.ConcurrencyMode(..)
   , B.Config(..)
   , B.Callbacks(..)
   , B.JuiceError(..)
   , B.State(..)
+  , B.setLogLevel
+  , B.setLoggingCb
   )
 where
 

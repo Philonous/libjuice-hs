@@ -36,6 +36,8 @@ juiceMaxSdpStringLen = {#const JUICE_MAX_SDP_STRING_LEN #}
 
 {# enum state as State {underscoreToCase} deriving (Show, Ord, Eq)#}
 
+{# enum concurrency_mode as ConcurrencyMode {underscoreToCase} deriving (Show, Ord, Eq) #}
+
 --------------------------------------------------------------------------------
 -- Config And Agent ------------------------------------------------------------
 --------------------------------------------------------------------------------
@@ -73,9 +75,10 @@ data Callbacks =
 
 data Config =
   Config
-  { configHost :: Text
+  { configConcurrencyMode :: ConcurrencyMode
+  , configHost :: Text
   , configPort :: Word16
-  -- [TurnServe elided]
+  -- [TurnServer elided]
   , configLocalPortRange :: (Word16, Word16)
   -- , config
   }
@@ -84,6 +87,7 @@ newAgent :: Config -> Callbacks -> IO Agent
 newAgent Config{..} Callbacks{..} =
   BS.useAsCString (Text.encodeUtf8 configHost) $ \hostBytes ->
   callocaBytes {#sizeof juice_config#} $ \configPtr -> do
+    {#set juice_config.concurrency_mode #} configPtr (fromIntegral $ fromEnum configConcurrencyMode)
     {#set juice_config.stun_server_host #} configPtr hostBytes
     {#set juice_config.stun_server_port#} configPtr (port configPort)
     let (portMin, portMax) = configLocalPortRange
@@ -201,3 +205,25 @@ textOut bufsize f =
     res <- f ptr
     bs <- BS.packCString ptr
     return (res, bs)
+
+--------------------------------------------------------------------------------
+-- Logging ---------------------------------------------------------------------
+--------------------------------------------------------------------------------
+
+{# enum log_level as LogLevel {underscoreToCase} deriving (Show, Ord, Eq)#}
+
+foreign import ccall "wrapper" mkLoggingCb ::
+    ({#type log_level_t#} -> Ptr CChar -> IO ())
+    -> IO {#type juice_log_cb_t#}
+
+setLogLevel :: LogLevel -> IO ()
+setLogLevel level =
+  {#call set_log_level#} (fromIntegral $ fromEnum level)
+
+setLoggingCb :: (LogLevel -> ByteString -> IO ()) -> IO ()
+setLoggingCb f = do
+  cb <- mkLoggingCb (\lvl cPtr -> do
+                        bs <- BS.packCString cPtr
+                        f (toEnum $ fromIntegral lvl) bs
+                    )
+  {#call set_log_handler#} cb
